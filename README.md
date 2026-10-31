@@ -36,9 +36,10 @@ setup is permission to open the device: a udev rule such as
     SUBSYSTEM=="usb", ATTRS{idVendor}=="1ab1", MODE="0660", GROUP="plugdev"
 
 in `/etc/udev/rules.d/99-usbtmc.rules`, with you in `plugdev`. On the Mac
-libusb and libpng come from Homebrew and no driver work is needed. The
-program looks for the scope every 2 s, so it can be plugged in after
-starting, and it reconnects after a cable pull.
+libusb and libpng come from Homebrew (`brew install libusb libpng`) and no
+driver work is needed; the same `make` builds there. The program looks for
+the scope every 2 s, so it can be plugged in after starting, and it
+reconnects after a cable pull.
 
 ## Using it
 
@@ -126,7 +127,7 @@ graphics module loads, into two alternating files under `$TMPDIR`.
   picture conversion, and the simulator.
 - `make shot` builds `mso1104_shot`, a test version that takes pictures of
   its own window (`MSO1104_SHOT=<file>`) and can run scripted key presses
-  and knob turns (`MSO1104_SCRIPT=CH3,HSC-,TLEV+`), Linux only.
+  and knob turns (`MSO1104_SCRIPT=CH3,HSC-,TLEV+`).
 - `Rigol_MSO1104Z-S.jpg`: the photograph the panel is laid out from.
 - `panel.png`, `scope_and_panel.jpg`: the panel, and the scope itself with
   the panel on the monitor behind it.

@@ -23,6 +23,7 @@ ifeq ($(OSTYPE),Darwin)
            -framework IOKit
     KEEP = -Wl,-u,_ami_maxx
     AMILINK = -Wl,-force_load,$(AMILIB) -Wl,-e,_pa_entry
+    CAPTURE = $(AMIDIR)/macosx/screen_capture.o
 else
     INCS = $(shell pkg-config --cflags libusb-1.0 libpng)
     LIBS = $(shell pkg-config --libs libusb-1.0 libpng) \
@@ -30,6 +31,7 @@ else
            -lxkbcommon -lfreetype -lfontconfig -lm -lpthread
     KEEP = -Wl,-u,ami_maxx
     AMILINK = $(AMIDIR)/stub/keeper.o $(AMILIB)
+    CAPTURE = $(AMIDIR)/linux/wayland/screen_capture.o
 endif
 
 CC = gcc
@@ -44,7 +46,7 @@ mso1104: $(SRCS) scope.h $(AMILIB)
 
 # test build: takes pictures of its own window, see MSO1104_SHOT in mso1104.c
 shot: $(SRCS) scope.h $(AMILIB)
-	$(CC) $(CFLAGS) -DSHOT $(SRCS) $(AMIDIR)/linux/wayland/screen_capture.o $(KEEP) $(AMILINK) $(LIBS) -lm -o mso1104_shot
+	$(CC) $(CFLAGS) -DSHOT $(SRCS) $(CAPTURE) $(KEEP) $(AMILINK) $(LIBS) -lm -o mso1104_shot
 
 sim: mso1104
 	./mso1104 --sim
