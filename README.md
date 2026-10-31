@@ -1,16 +1,21 @@
 # MSO1104 front panel
 
-A program that controls a Rigol MSO1104Z mixed signal oscilloscope over its
-USB port. The instrument identifies itself on the bus as a DS1104Z Plus, the
-name Rigol's firmware reports for this hardware whether or not the logic
-analyser option is fitted, so that is what the status strip shows; the badge
-on the panel says MSO1104Z as the real one does. Any DS1000Z or MSO1000Z
-model should work the same way. It is written in C using the AMI tool kit,
-and the window is drawn to look like the front of the scope: the screen at
-the left shows the instrument's own display, fetched about once a second,
-and the keys and knobs around it work the real ones. The scope's menus,
-cursors, measurements and so on are all driven through its own screen, so
-the panel is a remote control rather than a re-implementation.
+A remote control for the Rigol MSO1104Z and DS1104Z oscilloscopes, and the
+rest of the DS1000Z / MSO1000Z family. It drives the scope over its USB port
+and is written in C using the AMI tool kit. The window is drawn to look like
+the front of the scope: the screen at the left shows the instrument's own
+display, fetched about once a second, and the keys and knobs around it work
+the real ones. The scope's menus, cursors, measurements and so on are all
+driven through its own screen, so the panel is a remote control rather than
+a re-implementation.
+
+**Works with the DS1104Z too.** The MSO1104Z and the DS1104Z Plus are the
+same instrument; the MSO is the DS with the logic analyser option fitted,
+and both report themselves on the bus as `DS1104Z Plus`, which is what the
+status strip shows. The badge on the panel says MSO1104Z as the real one
+does. The other models in the family (DS1054Z, DS1074Z, DS1104Z, the Plus
+and MSO versions) share the front panel layout, the screen size and the
+command set, so they work the same; only the badge is different.
 
 ![The panel](panel.png)
 

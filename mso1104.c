@@ -1,5 +1,5 @@
 /*
- * MSO1104 front panel: drive a Rigol MSO1104Z mixed signal oscilloscope from
+ * MSO1104 front panel: drive a Rigol MSO1104Z or DS1104Z oscilloscope from
  * the desktop.
  *
  * The window is drawn as the face of the scope, laid out from a photograph
