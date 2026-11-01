@@ -12,24 +12,34 @@
  * Nothing bounds those waits. If the scope stops answering, the front
  * panel sees the frames stop (scope_poll), retires this link thread by
  * generation number and starts another; the old one exits when its read
- * finally returns. USB is the richer case:
+ * finally returns. On Windows only the AMI stream is built, not the
+ * probe, so the address must be given. USB is the richer case:
  *
  * USBTMC over libusb, bulk transfers only. The DS1000Z declares
- * and uses 64 byte bulk packets although it runs at high speed, so the host
- * sees every packet as a short packet: a reply is gathered piece by piece
- * until the declared size is in, and when the last piece is a full 64 bytes
- * the zero length packet the scope sends after it is taken too. The scope
- * also pads replies inconsistently, so a read stops at the declared size,
- * not the padded one. A reply larger than the request comes in several
- * transfers, each ended by the EOM flag of the last.
+ * and uses 64 byte bulk packets although it runs at high speed. Linux
+ * presents every one of them as a short packet, Windows (WinUSB) keeps to
+ * the declared size and ends a read only on a short packet or a full
+ * buffer, so a reply is read in a way that suits both: its first packet
+ * alone, for the header, then exactly the packets the header promises.
+ * When the reply ends on a full packet the scope follows it with a zero
+ * length packet, which is taken before the next request goes out. The
+ * scope also pads replies inconsistently, so a read stops at the declared
+ * size, not the padded one. A reply larger than the request comes in
+ * several transfers, each ended by the EOM flag of the last; the screen
+ * comes as a 500 byte transfer and then the rest.
  *
  * The screen picture is fetched as TIFF (about 47 kB, 0.45 s: the scope
- * encodes it two to three times faster than PNG, which takes 0.8 to 1.6 s)
- * and decoded by tiff.c; if that fails twice the PNG form is used instead,
- * decoded with libpng. Either way the picture is written as a 24 bit BMP,
- * the only picture format the AMI graphics module loads. Two files
- * alternate, so the front panel can load one while the next is written.
- * The last picture is kept as pixels so SAVE PNG can encode it.
+ * encodes it two to three times faster than PNG, which takes 0.8 to 1.6 s
+ * on Linux and 0.65 s on Windows) and decoded by tiff.c; if that fails
+ * twice the PNG form is used instead, decoded with libpng. Either way the
+ * picture is written as a 24 bit BMP, the only picture format the AMI
+ * graphics module loads. Two files alternate, so the front panel can load
+ * one while the next is written. The last picture is kept as pixels so
+ * SAVE PNG can encode it.
+ *
+ * AUTO holds the scope off the bus for about 6 s; the reply timeout allows
+ * for it. MSO1104_TRACE set in the environment logs the timing of every
+ * frame, every slow reply and every link loss to stderr.
  *
  * Commands found on the instrument, not in Rigol's programming guide:
  *   :SYST:KEY:PRES <key>       press a front panel key
@@ -49,6 +59,7 @@
 #include <unistd.h>
 #include <setjmp.h>
 #include <stdarg.h>
+#ifndef _WIN32
 #include <signal.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -59,6 +70,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#endif
 #include <libusb.h>
 #include <png.h>
 
@@ -74,7 +86,9 @@
 #define SETTINGS_MS   2000    /* re-read settings this often, when a pass is slow */
 #define SETTINGS_FAST 100     /* a pass under this (ms) is repeated every frame */
 #define RETRY_MS      2000    /* reconnect interval */
-#define REPLY_MS      5000    /* bus timeout for a reply */
+#define REPLY_MS      15000   /* bus timeout for a reply: AUTO holds the
+                                 scope off the bus for 5 s or more, and a
+                                 shorter wait took that for a dead link */
 #define FRAME_MS      15000   /* bus timeout for the screen picture */
 #define CONNECT_MS    1500    /* LAN probe: connect timeout for a given address */
 #define STALE_MS      10000   /* LAN: no frame for this long means the link is dead */
@@ -119,6 +133,7 @@ static long                  next_settings, next_retry;
 static int                   tiff_fails;    /* fetch as PNG once this reaches 2 */
 static int                   sim_running = 1, sim_single;
 static double                sim_phase;
+static int                   trace;   /* MSO1104_TRACE set: timings to stderr */
 
 static long now_ms(void)
 {
@@ -215,39 +230,58 @@ static int tmc_write(const char *s)
 static int tmc_read(uint8_t **out, size_t *outlen, int timeout)
 {
     uint8_t *acc = NULL, *buf = NULL;
-    size_t   acclen = 0, len, cap;
+    size_t   acclen = 0, len, want;
     uint8_t  h[12], zlp[64];
     uint32_t tsize = 0;
-    int      r, got, eom, have_hdr, last, zeros;
+    int      r, got, eom, zeros;
 
     for (;;) {
         tmc_header(h, 2, 1u << 20, 0); /* REQUEST_DEV_DEP_MSG_IN */
         r = libusb_bulk_transfer(dev, ep_out, h, 12, &got, 2000);
         if (r < 0) goto fail;
-        cap = 65536;
-        buf = malloc(cap);
+        /* The first packet carries the header. It is read alone, and then
+           exactly the packets the header says are coming are asked for, so
+           that a read ends when its bytes are in and never waits on a short
+           packet the scope may not send. A read sized larger than the reply
+           did: on Windows, where WinUSB keeps to the 64 byte packets the
+           scope declares, a reply that happened to fill its last packet left
+           the read waiting until the timeout, about one screen in forty.
+           Linux presents each packet as a short one and never noticed. A
+           reply whose last packet is full is followed by a zero length
+           packet, and that is taken before the next request goes out: left
+           on the pipe it corrupted the next reply from its fourth packet
+           on, under WinUSB at least. (The old test, a last read of exactly
+           64 bytes, held on Linux only, where that is what a read returns.) */
+        buf = malloc(64);
         if (!buf) { r = LIBUSB_ERROR_NO_MEM; goto fail; }
-        len = 0; have_hdr = 0; eom = 0; last = 0; zeros = 0;
-        while (!have_hdr || len < 12 + tsize) {
-            if (cap - len < 65536) {
-                uint8_t *nb = realloc(buf, cap * 2);
+        len = 0; zeros = 0;
+        while (len < 12) {
+            r = libusb_bulk_transfer(dev, ep_in, buf, 64, &got, timeout);
+            if (r < 0) goto fail;
+            if (got == 0) { if (++zeros > 4) { r = LIBUSB_ERROR_IO; goto fail; } continue; }
+            if (got < 12) { r = LIBUSB_ERROR_IO; goto fail; }
+            len = (size_t)got;
+        }
+        tsize = (uint32_t)buf[4] | ((uint32_t)buf[5] << 8) |
+                ((uint32_t)buf[6] << 16) | ((uint32_t)buf[7] << 24);
+        eom = buf[8] & 1;
+        if (trace && buf[1] != h[1])
+            fprintf(stderr, "scope: %ld: reply tag %d for request tag %d, %u bytes%s\n",
+                    now_ms() % 100000, buf[1], h[1], tsize, eom ? " eom" : "");
+        want = ((12 + (size_t)tsize + 63) / 64) * 64; /* whole packets, padding included */
+        if (want > 64) {
+            uint8_t *nb = realloc(buf, want);
 
-                if (!nb) { r = LIBUSB_ERROR_NO_MEM; goto fail; }
-                buf = nb; cap *= 2;
-            }
-            r = libusb_bulk_transfer(dev, ep_in, buf + len, 65536, &got, timeout);
+            if (!nb) { r = LIBUSB_ERROR_NO_MEM; goto fail; }
+            buf = nb;
+        }
+        while (len < 12 + tsize) {
+            r = libusb_bulk_transfer(dev, ep_in, buf + len, (int)(want - len), &got, timeout);
             if (r < 0) goto fail;
             if (got == 0 && ++zeros > 4) { r = LIBUSB_ERROR_IO; goto fail; }
             len += (size_t)got;
-            last = got;
-            if (!have_hdr && len >= 12) {
-                tsize = (uint32_t)buf[4] | ((uint32_t)buf[5] << 8) |
-                        ((uint32_t)buf[6] << 16) | ((uint32_t)buf[7] << 24);
-                eom = buf[8] & 1;
-                have_hdr = 1;
-            }
         }
-        if (last == 64) libusb_bulk_transfer(dev, ep_in, zlp, 64, &got, 300);
+        if (len % 64 == 0) libusb_bulk_transfer(dev, ep_in, zlp, 64, &got, 300);
         {
             uint8_t *na = realloc(acc, acclen + tsize + 1);
 
@@ -276,7 +310,9 @@ fail:
 /* The probe has its own sockets and timeouts, since finding the scope
    means trying many addresses at once and giving up on the silent ones
    quickly. Once the scope has answered *IDN? the probe socket is closed
-   and the link proper is opened as an AMI stream. */
+   and the link proper is opened as an AMI stream. It is written on POSIX
+   sockets and not built on Windows, where the address must be given. */
+#ifndef _WIN32
 
 /* Start a connect to each of n addresses at once and wait up to timeout
    for them: fds[i] is the connected socket, or -1. A single address is
@@ -516,6 +552,20 @@ static int probe_host(char *host, size_t hostlen)
     close(fd);
     return ok;
 }
+#else
+static int find_lan_scope(char *host, size_t hostlen)
+{
+    (void)host; (void)hostlen;
+    set_status("The LAN search is not built on Windows: give the address, --net HOST");
+    return -1;
+}
+
+static int probe_host(char *host, size_t hostlen)
+{
+    snprintf(host, hostlen, "%s", lan_host); /* straight to the open; it blocks */
+    return 0;
+}
+#endif
 
 /* ------------------------------------------------------------ the link */
 
@@ -629,6 +679,7 @@ static int link_read(uint8_t **out, size_t *outlen, int timeout, const char **wh
 static void link_fail(const char *what, const char *why)
 {
     set_status("%s: %s", what, why);
+    if (trace) fprintf(stderr, "scope: %ld: link lost on %s: %s\n", now_ms() % 100000, what, why);
     if (dev) {
         libusb_release_interface(dev, 0);
         libusb_reset_device(dev); /* clears a half finished transfer in the scope */
@@ -652,8 +703,12 @@ static int query(const char *cmd, char *buf, size_t buflen)
     size_t      n;
     const char *why;
 
+    long        t0 = now_ms();
+
     if (link_write(cmd, &why) < 0) { link_fail(cmd, why); return -1; }
     if (link_read(&rep, &n, REPLY_MS, &why) < 0) { link_fail(cmd, why); return -1; }
+    if (trace && now_ms() - t0 > 100)
+        fprintf(stderr, "scope: %ld: %s took %ld ms\n", now_ms() % 100000, cmd, now_ms() - t0);
     while (n > 0 && (rep[n - 1] == '\n' || rep[n - 1] == '\r' || rep[n - 1] == ' ')) n--;
     rep[n] = 0;
     snprintf(buf, buflen, "%s", (char *)rep);
@@ -804,8 +859,8 @@ static void frame_ready(const uint8_t *pix, int w, int h, int ms)
 static void fetch_frame(void)
 {
     uint8_t    *rep, *pix;
-    size_t      n, start, len;
-    long        t0 = now_ms();
+    size_t      n, start, len = 0;
+    long        t0 = now_ms(), t1;
     int         r, digits, w, h, tiff = tiff_fails < 2, ok = -1;
     const char *why;
 
@@ -821,13 +876,18 @@ static void fetch_frame(void)
     }
     /* IEEE 488.2 block: '#', one digit n, n digits of length, data */
     digits = n >= 2 && rep[0] == '#' ? rep[1] - '0' : 0;
+    t1 = now_ms();
     if (digits >= 1 && digits <= 9 && n >= (size_t)(2 + digits)) {
-        len = 0;
         for (r = 0; r < digits; r++) len = len * 10 + (size_t)(rep[2 + r] - '0');
         start = (size_t)(2 + digits);
         if (start + len > n) len = n - start;
         ok = tiff ? tiff_decode(rep + start, len, &w, &h, &pix) : png_decode(rep + start, len, &w, &h, &pix);
-    }
+    } else if (trace)
+        fprintf(stderr, "scope: %ld: screen reply is not a block: %u bytes \"%.20s\"\n",
+                now_ms() % 100000, (unsigned)n, rep);
+    if (trace)
+        fprintf(stderr, "scope: %ld: frame %ld: fetch %ld ms, decode %ld ms, %u bytes%s\n",
+                now_ms() % 100000, st.frames, t1 - t0, now_ms() - t1, (unsigned)len, ok ? " (bad)" : "");
     free(rep);
     if (ok) {
         if (tiff && ++tiff_fails >= 2) fprintf(stderr, "scope: no usable TIFF screen picture, using PNG\n");
@@ -932,10 +992,37 @@ static int open_device(void)
         set_status("libusb: %s", libusb_strerror(r));
         return -1;
     }
-    dev = libusb_open_device_with_vid_pid(ctx, SCOPE_VID, SCOPE_PID);
-    if (!dev) {
-        set_status("No scope found on USB");
-        return -1;
+    /* find the scope by hand rather than by open_device_with_vid_pid, so that
+       a scope that is there but cannot be opened is reported as such: on
+       Linux that is a permission (see the udev rule in the README), and on
+       Windows it is the driver, which has to be WinUSB for libusb to open
+       the device at all */
+    {
+        libusb_device **list;
+        ssize_t n, i;
+
+        dev = NULL;
+        r = 0;
+        n = libusb_get_device_list(ctx, &list);
+        for (i = 0; i < n && !dev; i++) {
+            struct libusb_device_descriptor dd;
+
+            if (libusb_get_device_descriptor(list[i], &dd) != 0) continue;
+            if (dd.idVendor != SCOPE_VID || dd.idProduct != SCOPE_PID) continue;
+            if ((r = libusb_open(list[i], &dev)) != 0) dev = NULL;
+        }
+        if (n >= 0) libusb_free_device_list(list, 1);
+        if (!dev) {
+            if (r != 0)
+#ifdef _WIN32
+                set_status("Scope found but not opened (%s): it needs the WinUSB driver, see README",
+                           libusb_strerror(r));
+#else
+                set_status("Scope found but not opened: %s", libusb_strerror(r));
+#endif
+            else set_status("No scope found on USB");
+            return -1;
+        }
     }
     libusb_set_auto_detach_kernel_driver(dev, 1); /* not supported everywhere: fine */
     d = libusb_get_device(dev);
@@ -1149,6 +1236,7 @@ static void worker(void)
         /* the front panel first: keys and knobs are what the user is waiting on */
         busy = 0;
         while (linked() && dequeue(cmd)) {
+            if (trace) fprintf(stderr, "scope: %ld: send %s\n", now_ms() % 100000, cmd);
             if (strchr(cmd, '?')) { char b[128]; query(cmd, b, sizeof b); }
             else send_cmd(cmd);
             busy = 1;
@@ -1192,8 +1280,15 @@ void scope_init(scope_state *s, int sim, const char *host)
     char *p;
     int c;
 
+#ifdef _WIN32
+    if (!tmp || !*tmp) tmp = getenv("TEMP");
+    if (!tmp || !*tmp) tmp = getenv("TMP");
+    if (!tmp || !*tmp) tmp = ".";
+#else
     if (!tmp || !*tmp) tmp = "/tmp";
+#endif
     memset(&st, 0, sizeof st);
+    trace = getenv("MSO1104_TRACE") != NULL;
     st.sim = sim;
     st.lan = host != NULL;
     if (host) {
@@ -1214,7 +1309,9 @@ void scope_init(scope_state *s, int sim, const char *host)
     shared_changed = 1;
     *s = st;
     if (st.lan) {
+#ifndef _WIN32
         signal(SIGPIPE, SIG_IGN);  /* a write to a scope that went away is an error, not a death */
+#endif
         ami_neterror(net_error);   /* and so is a failed open */
     }
     ami_newthread(worker);

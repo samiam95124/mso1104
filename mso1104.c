@@ -57,6 +57,9 @@ static long script_at;
 static void run_script(void);
 #endif
 
+/* MSO1104_TRACE set: timings of frames and redraws to stderr */
+static int trace;
+
 /* the panel is laid out in these units and scaled to the window; the case
    is the top 560, a status strip for the link sits under it */
 #define PANW 1050
@@ -866,6 +869,7 @@ int main(int argc, char *argv[])
         } else usage(argv[0]);
     }
     for (i = 0; i < H_LAST; i++) angle[i] = -2.2;
+    trace = getenv("MSO1104_TRACE") != NULL;
 #ifdef SHOT
     shot_file = getenv("MSO1104_SHOT");
     if (shot_file) { screen_capture_name(shot_file); shot_at = now_ms() + 4000; }
@@ -991,7 +995,16 @@ int main(int argc, char *argv[])
                 dirty = 0;
                 break;
         }
-        if (dirty && er.etype != ami_etterm) redraw();
+        if (dirty && er.etype != ami_etterm) {
+            long     t = now_ms();
+            unsigned was = shown_seq;
+
+            redraw();
+            if (trace && shown_seq != was)
+                fprintf(stderr, "panel: frame %u shown, redraw %ld ms\n", shown_seq, now_ms() - t);
+            else if (trace && er.etype != ami_ettim)
+                fprintf(stderr, "panel: event %d, redraw %ld ms\n", (int)er.etype, now_ms() - t);
+        }
     } while (er.etype != ami_etterm);
     scope_shutdown(&sc);
     return 0;
