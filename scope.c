@@ -2,18 +2,27 @@
  * Rigol DS1000Z / MSO1000Z link. See scope.h.
  *
  * Transport: USBTMC over libusb, bulk transfers only. The DS1000Z declares
- * and uses 64 byte bulk packets although it runs at high speed, so the host
- * sees every packet as a short packet: a reply is gathered piece by piece
- * until the declared size is in, and when the last piece is a full 64 bytes
- * the zero length packet the scope sends after it is taken too. The scope
- * also pads replies inconsistently, so a read stops at the declared size,
- * not the padded one. A reply larger than the request comes in several
- * transfers, each ended by the EOM flag of the last.
+ * and uses 64 byte bulk packets although it runs at high speed. Linux
+ * presents every one of them as a short packet, Windows (WinUSB) keeps to
+ * the declared size and ends a read only on a short packet or a full
+ * buffer, so a reply is read in a way that suits both: its first packet
+ * alone, for the header, then exactly the packets the header promises.
+ * When the reply ends on a full packet the scope follows it with a zero
+ * length packet, which is taken before the next request goes out. The
+ * scope also pads replies inconsistently, so a read stops at the declared
+ * size, not the padded one. A reply larger than the request comes in
+ * several transfers, each ended by the EOM flag of the last; the screen
+ * comes as a 500 byte transfer and then the rest.
  *
- * The screen picture is fetched as PNG (about 35 to 50 kB, 1.2 s), decoded
- * with libpng and written as a 24 bit BMP, the only picture format the AMI
- * graphics module loads. Two files alternate, so the front panel can load
- * one while the next is written.
+ * The screen picture is fetched as PNG (about 35 to 50 kB; 0.65 s on
+ * Windows, of which 0.63 s is the scope rendering it; 1.2 s on Linux),
+ * decoded with libpng and written as a 24 bit BMP, the only picture format
+ * the AMI graphics module loads. Two files alternate, so the front panel
+ * can load one while the next is written.
+ *
+ * AUTO holds the scope off the bus for about 6 s; the reply timeout allows
+ * for it. MSO1104_TRACE set in the environment logs the timing of every
+ * frame, every slow reply and every link loss to stderr.
  *
  * Commands found on the instrument, not in Rigol's programming guide:
  *   :SYST:KEY:PRES <key>       press a front panel key
@@ -45,7 +54,9 @@
 #define CMDLEN        64
 #define SETTINGS_MS   2000    /* re-read settings this often */
 #define RETRY_MS      2000    /* reconnect interval */
-#define REPLY_MS      5000    /* bus timeout for a reply */
+#define REPLY_MS      15000   /* bus timeout for a reply: AUTO holds the
+                                 scope off the bus for 5 s or more, and a
+                                 shorter wait took that for a dead link */
 #define FRAME_MS      15000   /* bus timeout for the screen picture */
 #define SCREEN_W      800
 #define SCREEN_H      480
@@ -75,6 +86,7 @@ static int                   frame_ix;
 static long                  next_settings, next_retry;
 static int                   sim_running = 1, sim_single;
 static double                sim_phase;
+static int                   trace;   /* MSO1104_TRACE set: timings to stderr */
 
 static long now_ms(void)
 {
@@ -171,39 +183,58 @@ static int tmc_write(const char *s)
 static int tmc_read(uint8_t **out, size_t *outlen, int timeout)
 {
     uint8_t *acc = NULL, *buf = NULL;
-    size_t   acclen = 0, len, cap;
+    size_t   acclen = 0, len, want;
     uint8_t  h[12], zlp[64];
     uint32_t tsize = 0;
-    int      r, got, eom, have_hdr, last, zeros;
+    int      r, got, eom, zeros;
 
     for (;;) {
         tmc_header(h, 2, 1u << 20, 0); /* REQUEST_DEV_DEP_MSG_IN */
         r = libusb_bulk_transfer(dev, ep_out, h, 12, &got, 2000);
         if (r < 0) goto fail;
-        cap = 65536;
-        buf = malloc(cap);
+        /* The first packet carries the header. It is read alone, and then
+           exactly the packets the header says are coming are asked for, so
+           that a read ends when its bytes are in and never waits on a short
+           packet the scope may not send. A read sized larger than the reply
+           did: on Windows, where WinUSB keeps to the 64 byte packets the
+           scope declares, a reply that happened to fill its last packet left
+           the read waiting until the timeout, about one screen in forty.
+           Linux presents each packet as a short one and never noticed. A
+           reply whose last packet is full is followed by a zero length
+           packet, and that is taken before the next request goes out: left
+           on the pipe it corrupted the next reply from its fourth packet
+           on, under WinUSB at least. (The old test, a last read of exactly
+           64 bytes, held on Linux only, where that is what a read returns.) */
+        buf = malloc(64);
         if (!buf) { r = LIBUSB_ERROR_NO_MEM; goto fail; }
-        len = 0; have_hdr = 0; eom = 0; last = 0; zeros = 0;
-        while (!have_hdr || len < 12 + tsize) {
-            if (cap - len < 65536) {
-                uint8_t *nb = realloc(buf, cap * 2);
+        len = 0; zeros = 0;
+        while (len < 12) {
+            r = libusb_bulk_transfer(dev, ep_in, buf, 64, &got, timeout);
+            if (r < 0) goto fail;
+            if (got == 0) { if (++zeros > 4) { r = LIBUSB_ERROR_IO; goto fail; } continue; }
+            if (got < 12) { r = LIBUSB_ERROR_IO; goto fail; }
+            len = (size_t)got;
+        }
+        tsize = (uint32_t)buf[4] | ((uint32_t)buf[5] << 8) |
+                ((uint32_t)buf[6] << 16) | ((uint32_t)buf[7] << 24);
+        eom = buf[8] & 1;
+        if (trace && buf[1] != h[1])
+            fprintf(stderr, "scope: %ld: reply tag %d for request tag %d, %u bytes%s\n",
+                    now_ms() % 100000, buf[1], h[1], tsize, eom ? " eom" : "");
+        want = ((12 + (size_t)tsize + 63) / 64) * 64; /* whole packets, padding included */
+        if (want > 64) {
+            uint8_t *nb = realloc(buf, want);
 
-                if (!nb) { r = LIBUSB_ERROR_NO_MEM; goto fail; }
-                buf = nb; cap *= 2;
-            }
-            r = libusb_bulk_transfer(dev, ep_in, buf + len, 65536, &got, timeout);
+            if (!nb) { r = LIBUSB_ERROR_NO_MEM; goto fail; }
+            buf = nb;
+        }
+        while (len < 12 + tsize) {
+            r = libusb_bulk_transfer(dev, ep_in, buf + len, (int)(want - len), &got, timeout);
             if (r < 0) goto fail;
             if (got == 0 && ++zeros > 4) { r = LIBUSB_ERROR_IO; goto fail; }
             len += (size_t)got;
-            last = got;
-            if (!have_hdr && len >= 12) {
-                tsize = (uint32_t)buf[4] | ((uint32_t)buf[5] << 8) |
-                        ((uint32_t)buf[6] << 16) | ((uint32_t)buf[7] << 24);
-                eom = buf[8] & 1;
-                have_hdr = 1;
-            }
         }
-        if (last == 64) libusb_bulk_transfer(dev, ep_in, zlp, 64, &got, 300);
+        if (len % 64 == 0) libusb_bulk_transfer(dev, ep_in, zlp, 64, &got, 300);
         {
             uint8_t *na = realloc(acc, acclen + tsize + 1);
 
@@ -230,6 +261,7 @@ fail:
 static void link_fail(const char *what, int r)
 {
     set_status("%s: %s", what, libusb_strerror(r));
+    if (trace) fprintf(stderr, "scope: %ld: link lost on %s: %s\n", now_ms() % 100000, what, libusb_strerror(r));
     if (dev) {
         libusb_release_interface(dev, 0);
         libusb_reset_device(dev); /* clears a half finished transfer in the scope */
@@ -249,8 +281,12 @@ static int query(const char *cmd, char *buf, size_t buflen)
     size_t   n;
     int      r;
 
+    long     t0 = now_ms();
+
     if ((r = tmc_write(cmd)) < 0) { link_fail(cmd, r); return -1; }
     if ((r = tmc_read(&rep, &n, REPLY_MS)) < 0) { link_fail(cmd, r); return -1; }
+    if (trace && now_ms() - t0 > 100)
+        fprintf(stderr, "scope: %ld: %s took %ld ms\n", now_ms() % 100000, cmd, now_ms() - t0);
     while (n > 0 && (rep[n - 1] == '\n' || rep[n - 1] == '\r' || rep[n - 1] == ' ')) n--;
     rep[n] = 0;
     snprintf(buf, buflen, "%s", (char *)rep);
@@ -267,7 +303,7 @@ static int qnum(const char *cmd, double *v)
     return 0;
 }
 
-static int send(const char *cmd)
+static int send_cmd(const char *cmd)
 {
     int r;
 
@@ -390,13 +426,18 @@ static void fetch_frame(void)
 {
     uint8_t *rep;
     size_t   n, start, len;
-    long     t0 = now_ms();
+    long     t0 = now_ms(), t1;
     int      r, digits;
 
     if ((r = tmc_write(":DISP:DATA? ON,OFF,PNG")) < 0) { link_fail("screen", r); return; }
     if ((r = tmc_read(&rep, &n, FRAME_MS)) < 0) { link_fail("screen", r); return; }
     /* IEEE 488.2 block: '#', one digit n, n digits of length, data */
-    if (n < 2 || rep[0] != '#') { free(rep); return; }
+    if (n < 2 || rep[0] != '#') {
+        if (trace) fprintf(stderr, "scope: %ld: screen reply is not a block: %u bytes \"%.20s\"\n",
+                           now_ms() % 100000, (unsigned)n, rep);
+        free(rep);
+        return;
+    }
     digits = rep[1] - '0';
     if (digits < 1 || digits > 9 || n < (size_t)(2 + digits)) { free(rep); return; }
     len = 0;
@@ -404,8 +445,12 @@ static void fetch_frame(void)
     start = (size_t)(2 + digits);
     if (start + len > n) len = n - start;
     frame_ix ^= 1;
+    t1 = now_ms();
     if (png_to_bmp(rep + start, len, frame_path[frame_ix]) == 0)
         publish_frame(frame_path[frame_ix], (int)(now_ms() - t0), rep + start, len);
+    if (trace)
+        fprintf(stderr, "scope: %ld: frame %ld: fetch %ld ms, decode %ld ms, %u bytes\n",
+                now_ms() % 100000, st.frames, t1 - t0, now_ms() - t1, (unsigned)len);
     free(rep);
 }
 
@@ -457,10 +502,37 @@ static int open_device(void)
         set_status("libusb: %s", libusb_strerror(r));
         return -1;
     }
-    dev = libusb_open_device_with_vid_pid(ctx, SCOPE_VID, SCOPE_PID);
-    if (!dev) {
-        set_status("No scope found on USB");
-        return -1;
+    /* find the scope by hand rather than by open_device_with_vid_pid, so that
+       a scope that is there but cannot be opened is reported as such: on
+       Linux that is a permission (see the udev rule in the README), and on
+       Windows it is the driver, which has to be WinUSB for libusb to open
+       the device at all */
+    {
+        libusb_device **list;
+        ssize_t n, i;
+
+        dev = NULL;
+        r = 0;
+        n = libusb_get_device_list(ctx, &list);
+        for (i = 0; i < n && !dev; i++) {
+            struct libusb_device_descriptor dd;
+
+            if (libusb_get_device_descriptor(list[i], &dd) != 0) continue;
+            if (dd.idVendor != SCOPE_VID || dd.idProduct != SCOPE_PID) continue;
+            if ((r = libusb_open(list[i], &dev)) != 0) dev = NULL;
+        }
+        if (n >= 0) libusb_free_device_list(list, 1);
+        if (!dev) {
+            if (r != 0)
+#ifdef _WIN32
+                set_status("Scope found but not opened (%s): it needs the WinUSB driver, see README",
+                           libusb_strerror(r));
+#else
+                set_status("Scope found but not opened: %s", libusb_strerror(r));
+#endif
+            else set_status("No scope found on USB");
+            return -1;
+        }
     }
     libusb_set_auto_detach_kernel_driver(dev, 1); /* not supported everywhere: fine */
     d = libusb_get_device(dev);
@@ -691,8 +763,9 @@ static void worker(void)
         /* the front panel first: keys and knobs are what the user is waiting on */
         busy = 0;
         while (dev && dequeue(cmd)) {
+            if (trace) fprintf(stderr, "scope: %ld: send %s\n", now_ms() % 100000, cmd);
             if (strchr(cmd, '?')) { char b[128]; query(cmd, b, sizeof b); }
-            else send(cmd);
+            else send_cmd(cmd);
             busy = 1;
         }
         if (!dev) continue;
@@ -724,8 +797,15 @@ void scope_init(scope_state *s, int sim)
     const char *tmp = getenv("TMPDIR");
     int c;
 
+#ifdef _WIN32
+    if (!tmp || !*tmp) tmp = getenv("TEMP");
+    if (!tmp || !*tmp) tmp = getenv("TMP");
+    if (!tmp || !*tmp) tmp = ".";
+#else
     if (!tmp || !*tmp) tmp = "/tmp";
+#endif
     memset(&st, 0, sizeof st);
+    trace = getenv("MSO1104_TRACE") != NULL;
     st.sim = sim;
     for (c = 0; c < SCOPE_NCH; c++) { st.chscale[c] = 1; st.chprobe[c] = 10; }
     st.tscale = 1e-3;
