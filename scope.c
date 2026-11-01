@@ -12,8 +12,9 @@
  * Nothing bounds those waits. If the scope stops answering, the front
  * panel sees the frames stop (scope_poll), retires this link thread by
  * generation number and starts another; the old one exits when its read
- * finally returns. On Windows only the AMI stream is built, not the
- * probe, so the address must be given. USB is the richer case:
+ * finally returns. The probe is BSD sockets on every system, Winsock
+ * included, with the interfaces listed by getifaddrs or, on Windows,
+ * GetAdaptersAddresses. USB is the richer case:
  *
  * USBTMC over libusb, bulk transfers only. The DS1000Z declares
  * and uses 64 byte bulk packets although it runs at high speed. Linux
@@ -70,6 +71,10 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#else
+#include <winsock2.h>   /* before windows.h, which the others pull in */
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
 #endif
 #include <libusb.h>
 #include <png.h>
@@ -153,10 +158,14 @@ static void sleep_ms(int ms)
 static void set_status(const char *fmt, ...)
 {
     va_list ap;
+    size_t  n;
 
     va_start(ap, fmt);
     vsnprintf(st.status, sizeof st.status, fmt, ap);
     va_end(ap);
+    /* Winsock's error messages end in a space and a newline */
+    for (n = strlen(st.status); n > 0 && (unsigned char)st.status[n - 1] <= ' '; n--) st.status[n - 1] = 0;
+    if (trace) fprintf(stderr, "scope: %ld: %s\n", now_ms() % 100000, st.status);
 }
 
 /* publish the thread's state */
@@ -310,74 +319,112 @@ fail:
 /* The probe has its own sockets and timeouts, since finding the scope
    means trying many addresses at once and giving up on the silent ones
    quickly. Once the scope has answered *IDN? the probe socket is closed
-   and the link proper is opened as an AMI stream. It is written on POSIX
-   sockets and not built on Windows, where the address must be given. */
-#ifndef _WIN32
+   and the link proper is opened as an AMI stream. The sockets are BSD
+   style on every system; the few places Winsock differs are shimmed here.
+   A socket is kept as an int on Windows too: Winsock's handles are kernel
+   handles, which are 32 bit values, and INVALID_SOCKET is -1. The AMI
+   network module has started Winsock by the time this runs. */
+#ifdef _WIN32
+typedef ULONG nfds_t;
+#define poll(p, n, t)     WSAPoll(p, n, t)
+#define sock_errno()      WSAGetLastError()
+#define SOCK_EINPROGRESS  WSAEWOULDBLOCK
+#define SOCK_EINTR        WSAEINTR
+#define sock_close(fd)    closesocket((SOCKET)(fd))
 
-/* Start a connect to each of n addresses at once and wait up to timeout
-   for them: fds[i] is the connected socket, or -1. A single address is
-   the ordinary connect; the subnet search does a batch. */
+/* set a socket blocking or not */
+static void sock_block(int fd, int on)
+{
+    u_long m = !on;
+
+    ioctlsocket((SOCKET)fd, FIONBIO, &m);
+}
+#else
+#define sock_errno()      errno
+#define SOCK_EINPROGRESS  EINPROGRESS
+#define SOCK_EINTR        EINTR
+#define sock_close(fd)    close(fd)
+
+static void sock_block(int fd, int on)
+{
+    int fl = fcntl(fd, F_GETFL);
+
+    fcntl(fd, F_SETFL, on ? fl & ~O_NONBLOCK : fl | O_NONBLOCK);
+}
+#endif
+
+/* Start a connect to each of n (at most PROBE_BATCH) addresses at once
+   and wait up to timeout for them: fds[i] is the connected socket, or -1.
+   A single address is the ordinary connect; the subnet search does a
+   batch. */
 static void connect_batch(const struct sockaddr_in *sa, int n, int timeout, int *fds)
 {
-    struct pollfd *pf = calloc((size_t)n, sizeof *pf);
-    int   i, r, err, left = 0;
+    struct pollfd pf[PROBE_BATCH];
+    char  pend[PROBE_BATCH];      /* connect still in progress */
+    int   i, r, err, one = 1, left = 0;
     long  end = now_ms() + timeout;
     socklen_t el;
 
     for (i = 0; i < n; i++) {
         fds[i] = -1;
-        if (!pf) continue;
-        pf[i].fd = -1;
-        r = socket(AF_INET, SOCK_STREAM, 0);
+        pend[i] = 0;
+        pf[i].fd = -1; /* poll and WSAPoll both skip a negative entry */
+        pf[i].events = POLLOUT;
+        pf[i].revents = 0;
+        r = (int)socket(AF_INET, SOCK_STREAM, 0);
         if (r < 0) continue;
-        fcntl(r, F_SETFL, fcntl(r, F_GETFL) | O_NONBLOCK);
-        if (connect(r, (const struct sockaddr *)&sa[i], sizeof sa[i]) < 0 && errno != EINPROGRESS) {
-            close(r);
+        sock_block(r, 0);
+        if (connect(r, (const struct sockaddr *)&sa[i], sizeof sa[i]) < 0 && sock_errno() != SOCK_EINPROGRESS) {
+            sock_close(r);
             continue;
         }
+        fds[i] = r;
         pf[i].fd = r;
-        pf[i].events = POLLOUT;
+        pend[i] = 1;
         left++;
     }
-    while (left > 0 && pf) {
+    while (left > 0) {
         long t = end - now_ms();
 
         if (t <= 0) break;
         if (poll(pf, (nfds_t)n, (int)t) <= 0) break;
         for (i = 0; i < n; i++) {
-            if (pf[i].fd < 0 || !pf[i].revents) continue;
+            if (!pend[i] || !pf[i].revents) continue;
             err = 0; el = sizeof err;
-            getsockopt(pf[i].fd, SOL_SOCKET, SO_ERROR, &err, &el);
-            if (err == 0 && !(pf[i].revents & (POLLERR | POLLHUP))) fds[i] = pf[i].fd;
-            else close(pf[i].fd);
+            getsockopt(fds[i], SOL_SOCKET, SO_ERROR, (char *)&err, &el);
+            if (err != 0 || (pf[i].revents & (POLLERR | POLLHUP))) {
+                sock_close(fds[i]);
+                fds[i] = -1;
+            }
             pf[i].fd = -1;
+            pend[i] = 0;
             left--;
         }
     }
-    for (i = 0; pf && i < n; i++) if (pf[i].fd >= 0) close(pf[i].fd);
-    free(pf);
     for (i = 0; i < n; i++) {
-        int one = 1;
-
-        if (fds[i] < 0) continue;
-        fcntl(fds[i], F_SETFL, fcntl(fds[i], F_GETFL) & ~O_NONBLOCK);
-        setsockopt(fds[i], IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        if (pend[i]) { /* never answered */
+            sock_close(fds[i]);
+            fds[i] = -1;
+        } else if (fds[i] >= 0) {
+            sock_block(fds[i], 1);
+            setsockopt(fds[i], IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
+        }
     }
 }
 
-/* write a command line to fd; -1 with errno on failure */
+/* write a command line to fd; -1 on failure */
 static int sock_write(int fd, const char *s)
 {
     char   buf[300];
     size_t n = strlen(s), off = 0;
-    ssize_t w;
+    int    w;
 
     if (n > sizeof buf - 2) { errno = EINVAL; return -1; }
     memcpy(buf, s, n);
     buf[n++] = '\n';
     while (off < n) {
-        w = send(fd, buf + off, n - off, 0);
-        if (w < 0) { if (errno == EINTR) continue; return -1; }
+        w = (int)send(fd, buf + off, (int)(n - off), 0);
+        if (w < 0) { if (sock_errno() == SOCK_EINTR) continue; return -1; }
         off += (size_t)w;
     }
     return 0;
@@ -391,9 +438,12 @@ static int sock_read(int fd, uint8_t **out, size_t *outlen, int timeout)
     uint8_t *buf = NULL, *nb;
     size_t   len = 0, cap = 0, skip = 0, want = 0, i;
     int      digits = 0, kind = 0; /* 0 unknown, 1 line, 2 block */
-    ssize_t  got;
-    struct pollfd pf = { fd, POLLIN, 0 };
+    int      got;
+    struct pollfd pf;
 
+    pf.fd = fd;
+    pf.events = POLLIN;
+    pf.revents = 0;
     for (;;) {
         /* enough yet? */
         for (; skip < len && (buf[skip] == '\n' || buf[skip] == '\r'); skip++) ;
@@ -420,10 +470,10 @@ static int sock_read(int fd, uint8_t **out, size_t *outlen, int timeout)
         }
         got = poll(&pf, 1, timeout);
         if (got == 0) { free(buf); errno = ETIMEDOUT; return -1; }
-        if (got < 0) { if (errno == EINTR) continue; free(buf); return -1; }
-        got = recv(fd, buf + len, cap - len - 1, 0); /* a byte spare for the terminator */
+        if (got < 0) { if (sock_errno() == SOCK_EINTR) continue; free(buf); return -1; }
+        got = (int)recv(fd, (char *)(buf + len), (int)(cap - len - 1), 0); /* a byte spare for the terminator */
         if (got == 0) { free(buf); errno = ECONNRESET; return -1; }
-        if (got < 0) { if (errno == EINTR) continue; free(buf); return -1; }
+        if (got < 0) { if (sock_errno() == SOCK_EINTR) continue; free(buf); return -1; }
         len += (size_t)got;
     }
     memmove(buf, buf + skip, want - skip);
@@ -446,15 +496,45 @@ static int is_rigol(int fd, int timeout, char *idn, size_t idnlen)
     return strstr(idn, "RIGOL") != NULL;
 }
 
-/* Search the local subnets for a Rigol on the SCPI port. Sets host and
-   returns 0, or -1 with the status set. */
-static int find_lan_scope(char *host, size_t hostlen)
+/* One interface's subnet, as the machine's address and the mask in host
+   order: if it is of a size worth searching, add every other host of it
+   to the candidates. Returns the list, grown; *ncand counts it. The first
+   subnet taken names the search in subnet, for the status line. */
+static struct sockaddr_in *add_subnet(struct sockaddr_in *cand, int *ncand, unsigned long mine,
+                                      unsigned long mask, char *subnet, size_t subnetlen)
+{
+    unsigned long net = mine & mask, hosts = ~mask & 0xffffffffUL, a;
+    struct sockaddr_in *nc;
+
+    if (hosts < 2 || hosts > PROBE_MAX) return cand; /* a point to point link, or too big */
+    nc = realloc(cand, (*ncand + hosts) * sizeof *cand);
+    if (!nc) return cand;
+    cand = nc;
+    if (!subnet[0]) {
+        int bits = 32;
+
+        for (a = hosts; a; a >>= 1) bits--;
+        snprintf(subnet, subnetlen, "%lu.%lu.%lu.%lu/%d", net >> 24, (net >> 16) & 255, (net >> 8) & 255, net & 255, bits);
+    }
+    for (a = net + 1; a < net + hosts; a++) {
+        if (a == mine) continue;
+        memset(&cand[*ncand], 0, sizeof cand[*ncand]);
+        cand[*ncand].sin_family = AF_INET;
+        cand[*ncand].sin_port = htons((uint16_t)lan_port);
+        cand[*ncand].sin_addr.s_addr = htonl(a);
+        (*ncand)++;
+    }
+    return cand;
+}
+
+/* The subnets of the machine's own interfaces that are up, other than the
+   loopback, as candidates. 0, or -1 with the status set if the interfaces
+   cannot be listed. */
+#ifndef _WIN32
+static int local_subnets(struct sockaddr_in **cand, int *ncand, char *subnet, size_t subnetlen)
 {
     struct ifaddrs     *ifa, *p;
-    struct sockaddr_in *cand = NULL, *sa, *nm;
-    int    ncand = 0, i, n, fds[PROBE_BATCH], found = -1;
-    unsigned long net, mask, hosts, a, mine;
-    char   idn[160], subnet[32] = "";
+    struct sockaddr_in *sa, *nm;
 
     if (getifaddrs(&ifa) < 0) {
         set_status("LAN: %s", strerror(errno));
@@ -465,33 +545,69 @@ static int find_lan_scope(char *host, size_t hostlen)
         if (p->ifa_flags & IFF_LOOPBACK || !(p->ifa_flags & IFF_UP)) continue;
         sa = (struct sockaddr_in *)p->ifa_addr;
         nm = (struct sockaddr_in *)p->ifa_netmask;
-        mine = ntohl(sa->sin_addr.s_addr);
-        mask = ntohl(nm->sin_addr.s_addr);
-        net = mine & mask;
-        hosts = ~mask & 0xffffffffUL;
-        if (hosts < 2 || hosts > PROBE_MAX) continue; /* a point to point link, or too big */
-        {
-            struct sockaddr_in *nc = realloc(cand, (ncand + hosts) * sizeof *cand);
-
-            if (!nc) break;
-            cand = nc;
-        }
-        if (!subnet[0]) {
-            int bits = 32;
-
-            for (a = ~mask & 0xffffffffUL; a; a >>= 1) bits--;
-            snprintf(subnet, sizeof subnet, "%lu.%lu.%lu.%lu/%d", net >> 24, (net >> 16) & 255, (net >> 8) & 255, net & 255, bits);
-        }
-        for (a = net + 1; a < net + hosts; a++) {
-            if (a == mine) continue;
-            memset(&cand[ncand], 0, sizeof cand[ncand]);
-            cand[ncand].sin_family = AF_INET;
-            cand[ncand].sin_port = htons((uint16_t)lan_port);
-            cand[ncand].sin_addr.s_addr = htonl(a);
-            ncand++;
-        }
+        *cand = add_subnet(*cand, ncand, ntohl(sa->sin_addr.s_addr), ntohl(nm->sin_addr.s_addr), subnet, subnetlen);
     }
     freeifaddrs(ifa);
+    return 0;
+}
+#else
+static int local_subnets(struct sockaddr_in **cand, int *ncand, char *subnet, size_t subnetlen)
+{
+    IP_ADAPTER_ADDRESSES       *aa = NULL, *na, *p;
+    IP_ADAPTER_UNICAST_ADDRESS *u;
+    ULONG len = 16384, r = ERROR_BUFFER_OVERFLOW;
+    unsigned long mask;
+    int   tries;
+
+    /* the list is of a size the call reports, so ask again if it grew */
+    for (tries = 0; tries < 3 && r == ERROR_BUFFER_OVERFLOW; tries++) {
+        na = realloc(aa, len);
+        if (!na) {
+            free(aa);
+            set_status("LAN: out of memory");
+            return -1;
+        }
+        aa = na;
+        r = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                                 NULL, aa, &len);
+    }
+    if (r == ERROR_NO_DATA) { /* no adapters at all */
+        free(aa);
+        return 0;
+    }
+    if (r != ERROR_SUCCESS) {
+        free(aa);
+        set_status("LAN: cannot list the network adapters (error %lu)", (unsigned long)r);
+        return -1;
+    }
+    for (p = aa; p; p = p->Next) {
+        if (p->OperStatus != IfOperStatusUp || p->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        for (u = p->FirstUnicastAddress; u; u = u->Next) {
+            if (!u->Address.lpSockaddr || u->Address.lpSockaddr->sa_family != AF_INET) continue;
+            mask = u->OnLinkPrefixLength >= 32 ? 0xffffffffUL
+                 : u->OnLinkPrefixLength == 0 ? 0
+                 : (0xffffffffUL << (32 - u->OnLinkPrefixLength)) & 0xffffffffUL;
+            *cand = add_subnet(*cand, ncand, ntohl(((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr.s_addr),
+                               mask, subnet, subnetlen);
+        }
+    }
+    free(aa);
+    return 0;
+}
+#endif
+
+/* Search the local subnets for a Rigol on the SCPI port. Sets host and
+   returns 0, or -1 with the status set. */
+static int find_lan_scope(char *host, size_t hostlen)
+{
+    struct sockaddr_in *cand = NULL;
+    int    ncand = 0, i, n, k, fds[PROBE_BATCH], found = -1;
+    char   idn[160], subnet[32] = "";
+
+    if (local_subnets(&cand, &ncand, subnet, sizeof subnet) < 0) {
+        free(cand);
+        return -1;
+    }
     if (ncand == 0) {
         set_status("No LAN to search (no subnet of /22 or smaller): give the address");
         free(cand);
@@ -500,8 +616,6 @@ static int find_lan_scope(char *host, size_t hostlen)
     set_status("Looking for the scope on %s", subnet);
     publish();
     for (i = 0; i < ncand && found < 0 && !stop_req; i += n) {
-        int k;
-
         n = ncand - i < PROBE_BATCH ? ncand - i : PROBE_BATCH;
         connect_batch(cand + i, n, PROBE_MS, fds);
         for (k = 0; k < n; k++) {
@@ -510,7 +624,7 @@ static int find_lan_scope(char *host, size_t hostlen)
                 found = 0;
                 snprintf(host, hostlen, "%s", inet_ntoa(cand[i + k].sin_addr));
             }
-            close(fds[k]);
+            sock_close(fds[k]);
         }
     }
     free(cand);
@@ -549,23 +663,9 @@ static int probe_host(char *host, size_t hostlen)
     }
     if (is_rigol(fd, 1000, idn, sizeof idn)) ok = 0;
     else set_status("%s is not a Rigol scope", lan_host);
-    close(fd);
+    sock_close(fd);
     return ok;
 }
-#else
-static int find_lan_scope(char *host, size_t hostlen)
-{
-    (void)host; (void)hostlen;
-    set_status("The LAN search is not built on Windows: give the address, --net HOST");
-    return -1;
-}
-
-static int probe_host(char *host, size_t hostlen)
-{
-    snprintf(host, hostlen, "%s", lan_host); /* straight to the open; it blocks */
-    return 0;
-}
-#endif
 
 /* ------------------------------------------------------------ the link */
 
