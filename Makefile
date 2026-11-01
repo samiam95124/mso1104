@@ -63,15 +63,15 @@ endif
 CC = gcc
 CFLAGS = -g3 -Wall -I$(AMIDIR)/include -I$(AMIDIR)/libc $(INCS)
 
-SRCS = mso1104.c scope.c
+SRCS = mso1104.c scope.c tiff.c
 
 all: mso1104
 
-mso1104: $(SRCS) scope.h $(AMILIB)
+mso1104: $(SRCS) scope.h tiff.h $(AMILIB)
 	$(CC) $(CFLAGS) $(SRCS) $(KEEP) $(AMILINK) $(LIBS) -lm -o $@$(EXE)
 
 # test build: takes pictures of its own window, see MSO1104_SHOT in mso1104.c
-shot: $(SRCS) scope.h $(AMILIB)
+shot: $(SRCS) scope.h tiff.h $(AMILIB)
 	$(CC) $(CFLAGS) -DSHOT $(SRCS) $(CAPTURE) $(KEEP) $(AMILINK) $(LIBS) -lm -o mso1104_shot$(EXE)
 
 sim: mso1104

@@ -1,7 +1,9 @@
 /*
- * Rigol MSO1000Z / DS1000Z scope link: USBTMC over libusb, SCPI commands.
+ * Rigol MSO1000Z / DS1000Z scope link: SCPI commands over USBTMC (libusb)
+ * or over the scope's raw socket on its LAN port.
  *
- * The scope is USB 1ab1:04ce. It is driven from a thread of its own, so the
+ * The scope is USB 1ab1:04ce, or TCP port 5555 on the LAN, where it can be
+ * found by probing the local subnet. It is driven from a thread of its own, so the
  * window never waits on the bus: the front panel queues key presses, knob
  * turns and commands, and the thread sends them, reads the settings back
  * every couple of seconds, and fetches the screen picture again and again.
@@ -15,8 +17,9 @@
 #ifndef SCOPE_H
 #define SCOPE_H
 
-#define SCOPE_VID 0x1ab1
-#define SCOPE_PID 0x04ce
+#define SCOPE_VID  0x1ab1
+#define SCOPE_PID  0x04ce
+#define SCOPE_PORT 5555        /* raw SCPI socket on the LAN port */
 
 #define SCOPE_NCH 4
 
@@ -24,25 +27,23 @@ typedef struct {
     /* link */
     int    connected;          /* device open and answering */
     int    sim;                /* simulated scope, no hardware */
+    int    lan;                /* link is the LAN port, else USB */
+    char   host[64];           /* LAN: the address in use, or found */
     char   status[128];        /* short human readable link status */
     char   idn[160];           /* *IDN? reply */
     char   model[32];          /* from idn: DS1104Z Plus */
     char   serial[32];
 
-    /* settings, as last read back */
+    /* settings, as last read back: just what the panel shows and steps */
     double tscale;             /* s/div */
-    double toffs;              /* s */
-    double srate;              /* Sa/s */
-    char   mdepth[16];         /* AUTO or points */
+    double toffs;              /* s; the simulator's only, not read back */
     int    chdisp[SCOPE_NCH];
     double chscale[SCOPE_NCH]; /* V/div */
     double choffs[SCOPE_NCH];  /* V */
     double chprobe[SCOPE_NCH]; /* ratio */
-    char   chcoup[SCOPE_NCH][4];
     double trlev;              /* V */
     char   trsrc[12];          /* CHAN1 .. */
     char   trstat[8];          /* TD WAIT RUN AUTO STOP */
-    char   trmode[8];          /* EDGE .. */
     char   trswe[8];           /* AUTO NORM SING */
     int    have_settings;
 
@@ -58,8 +59,10 @@ typedef struct {
     long     errors;           /* bus errors since start */
 } scope_state;
 
-/* Open the scope. sim nonzero simulates. Starts the link thread. */
-void scope_init(scope_state *s, int sim);
+/* Open the scope and start the link thread. sim nonzero simulates. host
+   NULL uses USB; "" finds the scope on the LAN by probing the local subnet;
+   otherwise it is the scope's address or name, with an optional :port. */
+void scope_init(scope_state *s, int sim, const char *host);
 
 /* Service the link: copy the thread's state out. Returns nonzero if changed. */
 int scope_poll(scope_state *s);

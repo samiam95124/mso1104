@@ -1,7 +1,21 @@
 /*
  * Rigol DS1000Z / MSO1000Z link. See scope.h.
  *
- * Transport: USBTMC over libusb, bulk transfers only. The DS1000Z declares
+ * Two transports. Over the LAN the scope's raw SCPI socket (TCP port 5555)
+ * takes a command line and answers with a line, or with an IEEE 488.2 block
+ * followed by a newline. Finding the scope is a probe with its own short
+ * timeouts: port 5555 on every host of the local subnet at once (or on the
+ * address given), and *IDN? of each that answers. Once found, the link is
+ * an AMI network stream (ami_opennetname) and plain stdio, and the thread
+ * blocks on it for each reply, as the tool kit intends: a request and
+ * reply protocol on one stream needs one thread and no readiness polling.
+ * Nothing bounds those waits. If the scope stops answering, the front
+ * panel sees the frames stop (scope_poll), retires this link thread by
+ * generation number and starts another; the old one exits when its read
+ * finally returns. On Windows only the AMI stream is built, not the
+ * probe, so the address must be given. USB is the richer case:
+ *
+ * USBTMC over libusb, bulk transfers only. The DS1000Z declares
  * and uses 64 byte bulk packets although it runs at high speed. Linux
  * presents every one of them as a short packet, Windows (WinUSB) keeps to
  * the declared size and ends a read only on a short packet or a full
@@ -14,11 +28,14 @@
  * several transfers, each ended by the EOM flag of the last; the screen
  * comes as a 500 byte transfer and then the rest.
  *
- * The screen picture is fetched as PNG (about 35 to 50 kB; 0.65 s on
- * Windows, of which 0.63 s is the scope rendering it; 1.2 s on Linux),
- * decoded with libpng and written as a 24 bit BMP, the only picture format
- * the AMI graphics module loads. Two files alternate, so the front panel
- * can load one while the next is written.
+ * The screen picture is fetched as TIFF (about 47 kB, 0.45 s: the scope
+ * encodes it two to three times faster than PNG, which takes 0.8 to 1.6 s
+ * on Linux and 0.65 s on Windows) and decoded by tiff.c; if that fails
+ * twice the PNG form is used instead, decoded with libpng. Either way the
+ * picture is written as a 24 bit BMP, the only picture format the AMI
+ * graphics module loads. Two files alternate, so the front panel can load
+ * one while the next is written. The last picture is kept as pixels so
+ * SAVE PNG can encode it.
  *
  * AUTO holds the scope off the bus for about 6 s; the reply timeout allows
  * for it. MSO1104_TRACE set in the environment logs the timing of every
@@ -42,22 +59,43 @@
 #include <unistd.h>
 #include <setjmp.h>
 #include <stdarg.h>
+#ifndef _WIN32
+#include <signal.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#endif
 #include <libusb.h>
 #include <png.h>
 
 #include <localdefs.h>
 #include <services.h>
+#include <network.h>
 
 #include "scope.h"
+#include "tiff.h"
 
 #define QMAX          64      /* command queue depth */
 #define CMDLEN        64
-#define SETTINGS_MS   2000    /* re-read settings this often */
+#define SETTINGS_MS   2000    /* re-read settings this often, when a pass is slow */
+#define SETTINGS_FAST 100     /* a pass under this (ms) is repeated every frame */
 #define RETRY_MS      2000    /* reconnect interval */
 #define REPLY_MS      15000   /* bus timeout for a reply: AUTO holds the
                                  scope off the bus for 5 s or more, and a
                                  shorter wait took that for a dead link */
 #define FRAME_MS      15000   /* bus timeout for the screen picture */
+#define CONNECT_MS    1500    /* LAN probe: connect timeout for a given address */
+#define STALE_MS      10000   /* LAN: no frame for this long means the link is dead */
+#define MIN_CYCLE_MS  100     /* a link faster than this would swamp the window */
+#define PROBE_MS      500     /* LAN search: connect timeout per batch */
+#define PROBE_BATCH   128     /* LAN search: hosts tried at once */
+#define PROBE_MAX     1024    /* LAN search: largest subnet tried */
 #define SCREEN_W      800
 #define SCREEN_H      480
 
@@ -71,19 +109,28 @@ static int          shared_changed;
 static char         queue[QMAX][CMDLEN];
 static int          qhead, qtail;
 static int          stop_req, thread_done;
-static uint8_t     *png_last;
-static size_t       png_last_len;
+static int          gen;             /* link thread generation; a bump retires the thread */
+static uint8_t     *pix_last;        /* the last picture, BGR top down */
+static int          pix_w, pix_h;
 
 /* ------------------------------------------------------------ thread state */
 
 static scope_state           st;
 static libusb_context       *ctx;
-static libusb_device_handle *dev;
+static libusb_device_handle *dev;          /* USB: open device */
+static __thread FILE        *netf;         /* LAN: the AMI stream, this thread's own */
+static __thread int          my_gen;       /* the generation this thread is */
+static __thread jmp_buf      worker_exit;  /* where a retired thread leaves from */
+static __thread jmp_buf      net_jmp;      /* where a network open error lands */
+static __thread char         net_err[128];
+static char                  lan_host[64]; /* LAN: address given, or "" to search */
+static int                   lan_port = SCOPE_PORT;
 static uint8_t               ep_in, ep_out;
 static uint8_t               tag = 1;
 static char                  frame_path[2][256];
 static int                   frame_ix;
 static long                  next_settings, next_retry;
+static int                   tiff_fails;    /* fetch as PNG once this reaches 2 */
 static int                   sim_running = 1, sim_single;
 static double                sim_phase;
 static int                   trace;   /* MSO1104_TRACE set: timings to stderr */
@@ -258,15 +305,390 @@ fail:
     return r;
 }
 
-static void link_fail(const char *what, int r)
+/* ------------------------------------------------------------ lan probe */
+
+/* The probe has its own sockets and timeouts, since finding the scope
+   means trying many addresses at once and giving up on the silent ones
+   quickly. Once the scope has answered *IDN? the probe socket is closed
+   and the link proper is opened as an AMI stream. It is written on POSIX
+   sockets and not built on Windows, where the address must be given. */
+#ifndef _WIN32
+
+/* Start a connect to each of n addresses at once and wait up to timeout
+   for them: fds[i] is the connected socket, or -1. A single address is
+   the ordinary connect; the subnet search does a batch. */
+static void connect_batch(const struct sockaddr_in *sa, int n, int timeout, int *fds)
 {
-    set_status("%s: %s", what, libusb_strerror(r));
-    if (trace) fprintf(stderr, "scope: %ld: link lost on %s: %s\n", now_ms() % 100000, what, libusb_strerror(r));
+    struct pollfd *pf = calloc((size_t)n, sizeof *pf);
+    int   i, r, err, left = 0;
+    long  end = now_ms() + timeout;
+    socklen_t el;
+
+    for (i = 0; i < n; i++) {
+        fds[i] = -1;
+        if (!pf) continue;
+        pf[i].fd = -1;
+        r = socket(AF_INET, SOCK_STREAM, 0);
+        if (r < 0) continue;
+        fcntl(r, F_SETFL, fcntl(r, F_GETFL) | O_NONBLOCK);
+        if (connect(r, (const struct sockaddr *)&sa[i], sizeof sa[i]) < 0 && errno != EINPROGRESS) {
+            close(r);
+            continue;
+        }
+        pf[i].fd = r;
+        pf[i].events = POLLOUT;
+        left++;
+    }
+    while (left > 0 && pf) {
+        long t = end - now_ms();
+
+        if (t <= 0) break;
+        if (poll(pf, (nfds_t)n, (int)t) <= 0) break;
+        for (i = 0; i < n; i++) {
+            if (pf[i].fd < 0 || !pf[i].revents) continue;
+            err = 0; el = sizeof err;
+            getsockopt(pf[i].fd, SOL_SOCKET, SO_ERROR, &err, &el);
+            if (err == 0 && !(pf[i].revents & (POLLERR | POLLHUP))) fds[i] = pf[i].fd;
+            else close(pf[i].fd);
+            pf[i].fd = -1;
+            left--;
+        }
+    }
+    for (i = 0; pf && i < n; i++) if (pf[i].fd >= 0) close(pf[i].fd);
+    free(pf);
+    for (i = 0; i < n; i++) {
+        int one = 1;
+
+        if (fds[i] < 0) continue;
+        fcntl(fds[i], F_SETFL, fcntl(fds[i], F_GETFL) & ~O_NONBLOCK);
+        setsockopt(fds[i], IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    }
+}
+
+/* write a command line to fd; -1 with errno on failure */
+static int sock_write(int fd, const char *s)
+{
+    char   buf[300];
+    size_t n = strlen(s), off = 0;
+    ssize_t w;
+
+    if (n > sizeof buf - 2) { errno = EINVAL; return -1; }
+    memcpy(buf, s, n);
+    buf[n++] = '\n';
+    while (off < n) {
+        w = send(fd, buf + off, n - off, 0);
+        if (w < 0) { if (errno == EINTR) continue; return -1; }
+        off += (size_t)w;
+    }
+    return 0;
+}
+
+/* read one reply from a probe socket into a malloc'd buffer: a line, or
+   an IEEE 488.2 block (#, digit, length, data). -1 with errno on failure,
+   ETIMEDOUT when nothing came. */
+static int sock_read(int fd, uint8_t **out, size_t *outlen, int timeout)
+{
+    uint8_t *buf = NULL, *nb;
+    size_t   len = 0, cap = 0, skip = 0, want = 0, i;
+    int      digits = 0, kind = 0; /* 0 unknown, 1 line, 2 block */
+    ssize_t  got;
+    struct pollfd pf = { fd, POLLIN, 0 };
+
+    for (;;) {
+        /* enough yet? */
+        for (; skip < len && (buf[skip] == '\n' || buf[skip] == '\r'); skip++) ;
+        if (!kind && len > skip) kind = buf[skip] == '#' ? 2 : 1;
+        if (kind == 1) {
+            for (i = skip; i < len; i++) if (buf[i] == '\n') break;
+            if (i < len) { want = i; break; }
+        } else if (kind == 2 && len > skip + 1) {
+            digits = buf[skip + 1] - '0';
+            if (digits < 1 || digits > 9) { kind = 1; continue; }
+            if (len >= skip + 2 + (size_t)digits) {
+                size_t bl = 0;
+
+                for (i = 0; i < (size_t)digits; i++) bl = bl * 10 + (size_t)(buf[skip + 2 + i] - '0');
+                want = skip + 2 + (size_t)digits + bl;
+                if (len >= want) break;
+            }
+        }
+        /* more */
+        if (cap - len < 65536) {
+            nb = realloc(buf, cap + 131072);
+            if (!nb) { free(buf); errno = ENOMEM; return -1; }
+            buf = nb; cap += 131072;
+        }
+        got = poll(&pf, 1, timeout);
+        if (got == 0) { free(buf); errno = ETIMEDOUT; return -1; }
+        if (got < 0) { if (errno == EINTR) continue; free(buf); return -1; }
+        got = recv(fd, buf + len, cap - len - 1, 0); /* a byte spare for the terminator */
+        if (got == 0) { free(buf); errno = ECONNRESET; return -1; }
+        if (got < 0) { if (errno == EINTR) continue; free(buf); return -1; }
+        len += (size_t)got;
+    }
+    memmove(buf, buf + skip, want - skip);
+    *outlen = want - skip;
+    buf[*outlen] = 0;
+    *out = buf;
+    return 0;
+}
+
+/* ask *IDN? on a connected socket; 1 if a Rigol answers, else 0 */
+static int is_rigol(int fd, int timeout, char *idn, size_t idnlen)
+{
+    uint8_t *rep;
+    size_t   n;
+
+    if (sock_write(fd, "*IDN?") < 0) return 0;
+    if (sock_read(fd, &rep, &n, timeout) < 0) return 0;
+    snprintf(idn, idnlen, "%s", (char *)rep);
+    free(rep);
+    return strstr(idn, "RIGOL") != NULL;
+}
+
+/* Search the local subnets for a Rigol on the SCPI port. Sets host and
+   returns 0, or -1 with the status set. */
+static int find_lan_scope(char *host, size_t hostlen)
+{
+    struct ifaddrs     *ifa, *p;
+    struct sockaddr_in *cand = NULL, *sa, *nm;
+    int    ncand = 0, i, n, fds[PROBE_BATCH], found = -1;
+    unsigned long net, mask, hosts, a, mine;
+    char   idn[160], subnet[32] = "";
+
+    if (getifaddrs(&ifa) < 0) {
+        set_status("LAN: %s", strerror(errno));
+        return -1;
+    }
+    for (p = ifa; p; p = p->ifa_next) {
+        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET || !p->ifa_netmask) continue;
+        if (p->ifa_flags & IFF_LOOPBACK || !(p->ifa_flags & IFF_UP)) continue;
+        sa = (struct sockaddr_in *)p->ifa_addr;
+        nm = (struct sockaddr_in *)p->ifa_netmask;
+        mine = ntohl(sa->sin_addr.s_addr);
+        mask = ntohl(nm->sin_addr.s_addr);
+        net = mine & mask;
+        hosts = ~mask & 0xffffffffUL;
+        if (hosts < 2 || hosts > PROBE_MAX) continue; /* a point to point link, or too big */
+        {
+            struct sockaddr_in *nc = realloc(cand, (ncand + hosts) * sizeof *cand);
+
+            if (!nc) break;
+            cand = nc;
+        }
+        if (!subnet[0]) {
+            int bits = 32;
+
+            for (a = ~mask & 0xffffffffUL; a; a >>= 1) bits--;
+            snprintf(subnet, sizeof subnet, "%lu.%lu.%lu.%lu/%d", net >> 24, (net >> 16) & 255, (net >> 8) & 255, net & 255, bits);
+        }
+        for (a = net + 1; a < net + hosts; a++) {
+            if (a == mine) continue;
+            memset(&cand[ncand], 0, sizeof cand[ncand]);
+            cand[ncand].sin_family = AF_INET;
+            cand[ncand].sin_port = htons((uint16_t)lan_port);
+            cand[ncand].sin_addr.s_addr = htonl(a);
+            ncand++;
+        }
+    }
+    freeifaddrs(ifa);
+    if (ncand == 0) {
+        set_status("No LAN to search (no subnet of /22 or smaller): give the address");
+        free(cand);
+        return -1;
+    }
+    set_status("Looking for the scope on %s", subnet);
+    publish();
+    for (i = 0; i < ncand && found < 0 && !stop_req; i += n) {
+        int k;
+
+        n = ncand - i < PROBE_BATCH ? ncand - i : PROBE_BATCH;
+        connect_batch(cand + i, n, PROBE_MS, fds);
+        for (k = 0; k < n; k++) {
+            if (fds[k] < 0) continue;
+            if (found < 0 && is_rigol(fds[k], 1000, idn, sizeof idn)) {
+                found = 0;
+                snprintf(host, hostlen, "%s", inet_ntoa(cand[i + k].sin_addr));
+            }
+            close(fds[k]);
+        }
+    }
+    free(cand);
+    if (found < 0) set_status("No scope found on %s", subnet);
+    return found;
+}
+
+/* Probe the address given: resolve it, connect with a timeout, and check
+   that a Rigol answers. Sets host to the address and returns 0, or -1
+   with the status set. */
+static int probe_host(char *host, size_t hostlen)
+{
+    struct addrinfo hints, *res, *r;
+    struct sockaddr_in sa;
+    char   port[8], idn[160];
+    int    fd = -1, e, ok = -1;
+
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    snprintf(port, sizeof port, "%d", lan_port);
+    if ((e = getaddrinfo(lan_host, port, &hints, &res)) != 0) {
+        set_status("%s: %s", lan_host, gai_strerror(e));
+        return -1;
+    }
+    for (r = res; r && fd < 0; r = r->ai_next) {
+        if (r->ai_addrlen != sizeof sa) continue;
+        memcpy(&sa, r->ai_addr, sizeof sa);
+        connect_batch(&sa, 1, CONNECT_MS, &fd);
+        if (fd >= 0) snprintf(host, hostlen, "%s", inet_ntoa(sa.sin_addr));
+    }
+    freeaddrinfo(res);
+    if (fd < 0) {
+        set_status("No answer from %s port %d", lan_host, lan_port);
+        return -1;
+    }
+    if (is_rigol(fd, 1000, idn, sizeof idn)) ok = 0;
+    else set_status("%s is not a Rigol scope", lan_host);
+    close(fd);
+    return ok;
+}
+#else
+static int find_lan_scope(char *host, size_t hostlen)
+{
+    (void)host; (void)hostlen;
+    set_status("The LAN search is not built on Windows: give the address, --net HOST");
+    return -1;
+}
+
+static int probe_host(char *host, size_t hostlen)
+{
+    snprintf(host, hostlen, "%s", lan_host); /* straight to the open; it blocks */
+    return 0;
+}
+#endif
+
+/* ------------------------------------------------------------ the link */
+
+/* the link is up: a device or a stream */
+static int linked(void)
+{
+    return dev != NULL || netf != NULL;
+}
+
+/* This thread has been retired by the front panel while it was blocked
+   (see scope_poll): leave at once, without touching the shared state the
+   thread that replaced it now owns. */
+static void stale_check(void)
+{
+    int stale;
+
+    ami_lock(lk);
+    stale = gen != my_gen;
+    ami_unlock(lk);
+    if (stale) longjmp(worker_exit, 1);
+}
+
+/* one reply from the AMI stream into a malloc'd buffer: a line without
+   its newline, or an IEEE 488.2 block (#, digit, length, data) and the
+   newline after it. Blocks until it is all in. -1 on a dead stream. */
+static int net_read(uint8_t **out, size_t *outlen)
+{
+    uint8_t *buf;
+    size_t   len = 0, cap = 256;
+    int      c, digits, i;
+
+    do c = fgetc(netf); while (c == '\n' || c == '\r');
+    if (c == EOF) return -1;
+    if (c == '#') {
+        c = fgetc(netf);
+        digits = c - '0';
+        if (c == EOF || digits < 1 || digits > 9) return -1;
+        for (i = 0; i < digits; i++) {
+            c = fgetc(netf);
+            if (c < '0' || c > '9') return -1;
+            len = len * 10 + (size_t)(c - '0');
+        }
+        buf = malloc(2 + (size_t)digits + len + 1);
+        if (!buf) return -1;
+        /* hand it back as the scope sent it, header and all, as USB does */
+        cap = (size_t)snprintf((char *)buf, 2 + (size_t)digits + 1, "#%d%0*zu", digits, digits, len);
+        if (fread(buf + cap, 1, len, netf) != len) { free(buf); return -1; }
+        c = fgetc(netf);                        /* the newline after the block */
+        if (c != EOF && c != '\n') ungetc(c, netf);
+        *out = buf;
+        *outlen = cap + len;
+        buf[*outlen] = 0;
+        return 0;
+    }
+    buf = malloc(cap);
+    if (!buf) return -1;
+    while (c != EOF && c != '\n') {
+        if (len + 2 > cap) {
+            uint8_t *nb = realloc(buf, cap * 2);
+
+            if (!nb) { free(buf); return -1; }
+            buf = nb; cap *= 2;
+        }
+        buf[len++] = (uint8_t)c;
+        c = fgetc(netf);
+    }
+    if (c == EOF) { free(buf); return -1; }
+    buf[len] = 0;
+    *out = buf;
+    *outlen = len;
+    return 0;
+}
+
+static const char *net_why(void)
+{
+    return ferror(netf) ? strerror(errno) : "connection closed";
+}
+
+/* write a command on whichever link is up; 0, or -1 with why set */
+static int link_write(const char *cmd, const char **why)
+{
+    int r;
+
+    if (netf) {
+        r = fputs(cmd, netf) == EOF || fputc('\n', netf) == EOF || fflush(netf) == EOF;
+        stale_check();
+        if (!r) return 0;
+        *why = net_why();
+        return -1;
+    }
+    if ((r = tmc_write(cmd)) < 0) { *why = libusb_strerror(r); return -1; }
+    return 0;
+}
+
+static int link_read(uint8_t **out, size_t *outlen, int timeout, const char **why)
+{
+    int r;
+
+    if (netf) {
+        r = net_read(out, outlen);
+        if (gen != my_gen && r == 0) free(*out); /* retired while blocked: leave nothing behind */
+        stale_check();
+        if (r == 0) return 0;
+        *why = net_why();
+        return -1;
+    }
+    if ((r = tmc_read(out, outlen, timeout)) < 0) { *why = libusb_strerror(r); return -1; }
+    return 0;
+}
+
+static void link_fail(const char *what, const char *why)
+{
+    set_status("%s: %s", what, why);
+    if (trace) fprintf(stderr, "scope: %ld: link lost on %s: %s\n", now_ms() % 100000, what, why);
     if (dev) {
         libusb_release_interface(dev, 0);
         libusb_reset_device(dev); /* clears a half finished transfer in the scope */
         libusb_close(dev);
         dev = NULL;
+    }
+    if (netf) {
+        fclose(netf);
+        netf = NULL;
     }
     st.connected = 0;
     st.errors++;
@@ -277,14 +699,14 @@ static void link_fail(const char *what, int r)
 /* query: reply as a trimmed string in buf; nonzero on failure (link dropped) */
 static int query(const char *cmd, char *buf, size_t buflen)
 {
-    uint8_t *rep;
-    size_t   n;
-    int      r;
+    uint8_t    *rep;
+    size_t      n;
+    const char *why;
 
-    long     t0 = now_ms();
+    long        t0 = now_ms();
 
-    if ((r = tmc_write(cmd)) < 0) { link_fail(cmd, r); return -1; }
-    if ((r = tmc_read(&rep, &n, REPLY_MS)) < 0) { link_fail(cmd, r); return -1; }
+    if (link_write(cmd, &why) < 0) { link_fail(cmd, why); return -1; }
+    if (link_read(&rep, &n, REPLY_MS, &why) < 0) { link_fail(cmd, why); return -1; }
     if (trace && now_ms() - t0 > 100)
         fprintf(stderr, "scope: %ld: %s took %ld ms\n", now_ms() % 100000, cmd, now_ms() - t0);
     while (n > 0 && (rep[n - 1] == '\n' || rep[n - 1] == '\r' || rep[n - 1] == ' ')) n--;
@@ -305,9 +727,9 @@ static int qnum(const char *cmd, double *v)
 
 static int send_cmd(const char *cmd)
 {
-    int r;
+    const char *why;
 
-    if ((r = tmc_write(cmd)) < 0) { link_fail(cmd, r); return -1; }
+    if (link_write(cmd, &why) < 0) { link_fail(cmd, why); return -1; }
     return 0;
 }
 
@@ -355,12 +777,13 @@ static void png_mem_read(png_structp png, png_bytep out, png_size_t len)
     m->off += len;
 }
 
-/* decode a PNG in memory and write it as a BMP; returns 0 on success */
-static int png_to_bmp(const uint8_t *data, size_t n, const char *path)
+/* decode a PNG in memory to top-down BGR pixels; returns 0 on success */
+static int png_decode(const uint8_t *data, size_t n, int *wout, int *hout, uint8_t **pix)
 {
     png_structp png = NULL;
     png_infop   info = NULL;
     png_bytep  *rows = NULL;
+    uint8_t    *out = NULL;
     memrd       m = { data, n, 0 };
     png_uint_32 w, h, y;
     int         depth, ctype, ok = -1;
@@ -383,79 +806,104 @@ static int png_to_bmp(const uint8_t *data, size_t n, const char *path)
     png_set_bgr(png);
     png_read_update_info(png, info);
     if (png_get_rowbytes(png, info) != w * 3) goto done;
+    if (w > 4096 || h > 4096) goto done;
     rows = calloc(h, sizeof *rows);
-    if (!rows) goto done;
-    for (y = 0; y < h; y++) {
-        rows[y] = malloc(w * 3);
-        if (!rows[y]) goto done;
-    }
+    out = malloc((size_t)w * h * 3);
+    if (!rows || !out) goto done;
+    for (y = 0; y < h; y++) rows[y] = out + (size_t)y * w * 3;
     png_read_image(png, rows);
-    ok = bmp_write(path, (int)w, (int)h, rows);
+    ok = 0;
 done:
-    if (rows) {
-        for (y = 0; y < h; y++) free(rows[y]);
-        free(rows);
-    }
+    free(rows);
     png_destroy_read_struct(&png, &info, NULL);
-    return ok;
+    if (ok) { free(out); return -1; }
+    *wout = (int)w;
+    *hout = (int)h;
+    *pix = out;
+    return 0;
 }
 
-/* a new frame file is ready: tell the front panel, and keep the PNG */
-static void publish_frame(const char *path, int ms, const uint8_t *png, size_t n)
+/* A picture is decoded: write it as the next BMP, tell the front panel,
+   and keep the pixels for SAVE PNG. pix is top-down BGR, w*h*3. */
+static void frame_ready(const uint8_t *pix, int w, int h, int ms)
 {
-    ami_lock(lk);
-    snprintf(shared.frame, sizeof shared.frame, "%s", path);
-    shared.frame_seq++;
-    shared.frame_ms = ms;
-    shared.frames++;
-    shared_changed = 1;
-    if (png) {
-        uint8_t *np = realloc(png_last, n);
+    uint8_t **rows = malloc((size_t)h * sizeof *rows);
+    int       y;
 
-        if (np) { memcpy(np, png, n); png_last = np; png_last_len = n; }
+    if (!rows) return;
+    for (y = 0; y < h; y++) rows[y] = (uint8_t *)pix + (size_t)y * w * 3;
+    frame_ix ^= 1;
+    if (bmp_write(frame_path[frame_ix], w, h, rows) == 0) {
+        ami_lock(lk);
+        snprintf(shared.frame, sizeof shared.frame, "%s", frame_path[frame_ix]);
+        shared.frame_seq++;
+        shared.frame_ms = ms;
+        shared.frames++;
+        shared_changed = 1;
+        {
+            uint8_t *np = realloc(pix_last, (size_t)w * h * 3);
+
+            if (np) { memcpy(np, pix, (size_t)w * h * 3); pix_last = np; pix_w = w; pix_h = h; }
+        }
+        ami_unlock(lk);
+        st.frame_seq = shared.frame_seq;
+        st.frames = shared.frames;
+        st.frame_ms = ms;
+        snprintf(st.frame, sizeof st.frame, "%s", frame_path[frame_ix]);
     }
-    ami_unlock(lk);
-    st.frame_seq = shared.frame_seq;
-    st.frames = shared.frames;
-    st.frame_ms = ms;
-    snprintf(st.frame, sizeof st.frame, "%s", path);
+    free(rows);
 }
 
-/* fetch the screen as PNG, convert, publish */
+/* fetch the screen, as TIFF while that works and as PNG otherwise, decode,
+   publish */
 static void fetch_frame(void)
 {
-    uint8_t *rep;
-    size_t   n, start, len;
-    long     t0 = now_ms(), t1;
-    int      r, digits;
+    uint8_t    *rep, *pix;
+    size_t      n, start, len = 0;
+    long        t0 = now_ms(), t1;
+    int         r, digits, w, h, tiff = tiff_fails < 2, ok = -1;
+    const char *why;
 
-    if ((r = tmc_write(":DISP:DATA? ON,OFF,PNG")) < 0) { link_fail("screen", r); return; }
-    if ((r = tmc_read(&rep, &n, FRAME_MS)) < 0) { link_fail("screen", r); return; }
-    /* IEEE 488.2 block: '#', one digit n, n digits of length, data */
-    if (n < 2 || rep[0] != '#') {
-        if (trace) fprintf(stderr, "scope: %ld: screen reply is not a block: %u bytes \"%.20s\"\n",
-                           now_ms() % 100000, (unsigned)n, rep);
-        free(rep);
+    if (link_write(tiff ? ":DISP:DATA? ON,OFF,TIFF" : ":DISP:DATA? ON,OFF,PNG", &why) < 0) {
+        if (tiff) tiff_fails++;
+        link_fail("screen", why);
         return;
     }
-    digits = rep[1] - '0';
-    if (digits < 1 || digits > 9 || n < (size_t)(2 + digits)) { free(rep); return; }
-    len = 0;
-    for (r = 0; r < digits; r++) len = len * 10 + (size_t)(rep[2 + r] - '0');
-    start = (size_t)(2 + digits);
-    if (start + len > n) len = n - start;
-    frame_ix ^= 1;
+    if (link_read(&rep, &n, FRAME_MS, &why) < 0) {
+        if (tiff) tiff_fails++;
+        link_fail("screen", why);
+        return;
+    }
+    /* IEEE 488.2 block: '#', one digit n, n digits of length, data */
+    digits = n >= 2 && rep[0] == '#' ? rep[1] - '0' : 0;
     t1 = now_ms();
-    if (png_to_bmp(rep + start, len, frame_path[frame_ix]) == 0)
-        publish_frame(frame_path[frame_ix], (int)(now_ms() - t0), rep + start, len);
+    if (digits >= 1 && digits <= 9 && n >= (size_t)(2 + digits)) {
+        for (r = 0; r < digits; r++) len = len * 10 + (size_t)(rep[2 + r] - '0');
+        start = (size_t)(2 + digits);
+        if (start + len > n) len = n - start;
+        ok = tiff ? tiff_decode(rep + start, len, &w, &h, &pix) : png_decode(rep + start, len, &w, &h, &pix);
+    } else if (trace)
+        fprintf(stderr, "scope: %ld: screen reply is not a block: %u bytes \"%.20s\"\n",
+                now_ms() % 100000, (unsigned)n, rep);
     if (trace)
-        fprintf(stderr, "scope: %ld: frame %ld: fetch %ld ms, decode %ld ms, %u bytes\n",
-                now_ms() % 100000, st.frames, t1 - t0, now_ms() - t1, (unsigned)len);
+        fprintf(stderr, "scope: %ld: frame %ld: fetch %ld ms, decode %ld ms, %u bytes%s\n",
+                now_ms() % 100000, st.frames, t1 - t0, now_ms() - t1, (unsigned)len, ok ? " (bad)" : "");
     free(rep);
+    if (ok) {
+        if (tiff && ++tiff_fails >= 2) fprintf(stderr, "scope: no usable TIFF screen picture, using PNG\n");
+        return;
+    }
+    frame_ready(pix, w, h, (int)(now_ms() - t0));
+    free(pix);
 }
 
 /* ------------------------------------------------------------ settings */
 
+/* The 21 values the panel uses: the strip, the key lamps, and the vertical
+   knobs' starting points. A query takes about 1 ms over the LAN, so the
+   pass is cheap; what is not cheap is the first command after a screen
+   fetch, which the scope holds for about 350 ms two times in three, and
+   that is paid whether this pass or the next fetch comes first. */
 static int read_settings(void)
 {
     char   b[64];
@@ -463,9 +911,6 @@ static int read_settings(void)
     double v;
 
     if (qnum(":TIM:SCAL?", &st.tscale)) return -1;
-    if (qnum(":TIM:MAIN:OFFS?", &st.toffs)) return -1;
-    if (qnum(":ACQ:SRAT?", &st.srate)) return -1;
-    if (query(":ACQ:MDEP?", st.mdepth, sizeof st.mdepth)) return -1;
     for (c = 0; c < SCOPE_NCH; c++) {
         snprintf(b, sizeof b, ":CHAN%d:DISP?", c + 1);
         if (qnum(b, &v)) return -1;
@@ -476,13 +921,10 @@ static int read_settings(void)
         if (qnum(b, &st.choffs[c])) return -1;
         snprintf(b, sizeof b, ":CHAN%d:PROB?", c + 1);
         if (qnum(b, &st.chprobe[c])) return -1;
-        snprintf(b, sizeof b, ":CHAN%d:COUP?", c + 1);
-        if (query(b, st.chcoup[c], sizeof st.chcoup[c])) return -1;
     }
     if (qnum(":TRIG:EDG:LEV?", &st.trlev)) return -1;
     if (query(":TRIG:EDG:SOUR?", st.trsrc, sizeof st.trsrc)) return -1;
     if (query(":TRIG:STAT?", st.trstat, sizeof st.trstat)) return -1;
-    if (query(":TRIG:MODE?", st.trmode, sizeof st.trmode)) return -1;
     if (query(":TRIG:SWE?", st.trswe, sizeof st.trswe)) return -1;
     st.have_settings = 1;
     return 0;
@@ -490,12 +932,60 @@ static int read_settings(void)
 
 /* ------------------------------------------------------------ device */
 
+/* the link is up: ask who it is, record it, and say connected */
+static int identify(void)
+{
+    char b[160], *p, *q;
+
+    if (query("*IDN?", b, sizeof b)) return -1; /* link_fail already ran */
+    snprintf(st.idn, sizeof st.idn, "%s", b);
+    /* RIGOL TECHNOLOGIES,DS1104Z Plus,DS1ZC195002530,00.04.04.SP3 */
+    st.model[0] = st.serial[0] = 0;
+    p = strchr(b, ',');
+    if (p) {
+        q = strchr(++p, ',');
+        if (q) {
+            snprintf(st.model, sizeof st.model, "%.*s", (int)(q - p), p);
+            p = q + 1;
+            q = strchr(p, ',');
+            snprintf(st.serial, sizeof st.serial, "%.*s", q ? (int)(q - p) : (int)strlen(p), p);
+        }
+    }
+    st.connected = 1;
+    st.frames = 0;
+    set_status("%s %s", st.model, st.serial);
+    next_settings = 0;
+    publish();
+    return 0;
+}
+
+/* the AMI network module reports an error here, instead of aborting */
+static void net_error(const char *es)
+{
+    snprintf(net_err, sizeof net_err, "%s", es);
+    longjmp(net_jmp, 1);
+}
+
+/* the LAN: probe for the scope, at the address given or over the subnet,
+   then open the link to it as an AMI stream */
+static int open_lan(void)
+{
+    if ((lan_host[0] ? probe_host(st.host, sizeof st.host)
+                     : find_lan_scope(st.host, sizeof st.host)) < 0) return -1;
+    if (setjmp(net_jmp)) {
+        set_status("%s: %s", st.host, net_err);
+        return -1;
+    }
+    netf = ami_opennetname(st.host, lan_port, FALSE);
+    stale_check();
+    return identify();
+}
+
 static int open_device(void)
 {
     struct libusb_config_descriptor *cfg;
     const struct libusb_interface_descriptor *ifd;
     libusb_device *d;
-    char   b[160], *p, *q;
     int    r, i;
 
     if (!ctx && (r = libusb_init(&ctx)) < 0) {
@@ -561,26 +1051,7 @@ static int open_device(void)
         return -1;
     }
     tag = 1;
-    if (query("*IDN?", b, sizeof b)) return -1; /* link_fail already ran */
-    snprintf(st.idn, sizeof st.idn, "%s", b);
-    /* RIGOL TECHNOLOGIES,DS1104Z Plus,DS1ZC195002530,00.04.04.SP3 */
-    st.model[0] = st.serial[0] = 0;
-    p = strchr(b, ',');
-    if (p) {
-        q = strchr(++p, ',');
-        if (q) {
-            snprintf(st.model, sizeof st.model, "%.*s", (int)(q - p), p);
-            p = q + 1;
-            q = strchr(p, ',');
-            snprintf(st.serial, sizeof st.serial, "%.*s", q ? (int)(q - p) : (int)strlen(p), p);
-        }
-    }
-    st.connected = 1;
-    st.frames = 0;
-    set_status("%s %s", st.model, st.serial);
-    next_settings = 0;
-    publish();
-    return 0;
+    return identify();
 }
 
 /* ------------------------------------------------------------ simulator */
@@ -608,19 +1079,15 @@ static void sim_init(void)
     st.connected = 1;
     st.tscale = 2e-4;
     st.toffs = 0;
-    st.srate = 5e8;
-    snprintf(st.mdepth, sizeof st.mdepth, "AUTO");
     for (c = 0; c < SCOPE_NCH; c++) {
         st.chdisp[c] = c < 2;
         st.chscale[c] = 1.0;
         st.choffs[c] = c == 1 ? -2.0 : 0;
         st.chprobe[c] = 10;
-        snprintf(st.chcoup[c], sizeof st.chcoup[c], "DC");
     }
     st.trlev = 0.5;
     snprintf(st.trsrc, sizeof st.trsrc, "CHAN1");
     snprintf(st.trstat, sizeof st.trstat, "AUTO");
-    snprintf(st.trmode, sizeof st.trmode, "EDGE");
     snprintf(st.trswe, sizeof st.trswe, "AUTO");
     st.have_settings = 1;
     snprintf(st.idn, sizeof st.idn, "RIGOL TECHNOLOGIES,DS1104Z Plus,SIMULATED,00.00");
@@ -668,13 +1135,11 @@ static void sim_command(const char *cmd)
 static void sim_frame(void)
 {
     static uint8_t  pix[SCREEN_H][SCREEN_W][3];
-    static uint8_t *rows[SCREEN_H];
     static const uint8_t chcol[4][3] = { { 0, 255, 255 }, { 255, 255, 0 }, { 255, 0, 255 }, { 255, 128, 0 } }; /* BGR */
     int    x, y, c, gx1 = 85, gy1 = 40, gx2 = 685, gy2 = 440, gw = gx2 - gx1, gh = gy2 - gy1;
     double t, v, py;
     long   t0 = now_ms();
 
-    for (y = 0; y < SCREEN_H; y++) rows[y] = pix[y][0];
     memset(pix, 0, sizeof pix);
     /* the bars: top and bottom status, and the menu column at the right */
     for (y = 0; y < 30; y++) for (x = 0; x < SCREEN_W; x++) { pix[y][x][0] = 40; pix[y][x][1] = 40; pix[y][x][2] = 40; }
@@ -727,9 +1192,7 @@ static void sim_frame(void)
     y = (int)lround(gy1 + gh / 2.0 - (st.trlev + st.choffs[0]) / st.chscale[0] * (gh / 8.0));
     if (y >= gy1 && y <= gy2)
         for (x = gx2 + 2; x < gx2 + 12; x++) { pix[y][x][0] = 0; pix[y][x][1] = 140; pix[y][x][2] = 255; pix[y - 1][x][0] = 0; pix[y - 1][x][1] = 140; pix[y - 1][x][2] = 255; }
-    frame_ix ^= 1;
-    if (bmp_write(frame_path[frame_ix], SCREEN_W, SCREEN_H, rows) == 0)
-        publish_frame(frame_path[frame_ix], (int)(now_ms() - t0), NULL, 0);
+    frame_ready(pix[0][0], SCREEN_W, SCREEN_H, (int)(now_ms() - t0));
     if (sim_single && sim_running) { sim_running = 0; snprintf(st.trstat, sizeof st.trstat, "STOP"); }
 }
 
@@ -738,9 +1201,19 @@ static void sim_frame(void)
 static void worker(void)
 {
     char cmd[CMDLEN];
-    long t;
+    long t, last_cycle = 0;
     int  busy;
 
+    ami_lock(lk);
+    my_gen = gen;
+    ami_unlock(lk);
+    if (setjmp(worker_exit)) {
+        /* retired: a later thread has the link now; just go */
+        if (netf) fclose(netf);
+        return;
+    }
+    st.connected = 0; /* a replacement starts over; the first is already so */
+    next_retry = 0;
     while (!stop_req) {
         if (st.sim) {
             while (dequeue(cmd)) sim_command(cmd);
@@ -750,9 +1223,9 @@ static void worker(void)
             continue;
         }
         t = now_ms();
-        if (!dev) {
+        if (!linked()) {
             if (t >= next_retry) {
-                if (open_device() < 0) {
+                if ((st.lan ? open_lan() : open_device()) < 0) {
                     next_retry = now_ms() + RETRY_MS;
                     publish();
                 }
@@ -762,23 +1235,28 @@ static void worker(void)
         }
         /* the front panel first: keys and knobs are what the user is waiting on */
         busy = 0;
-        while (dev && dequeue(cmd)) {
+        while (linked() && dequeue(cmd)) {
             if (trace) fprintf(stderr, "scope: %ld: send %s\n", now_ms() % 100000, cmd);
             if (strchr(cmd, '?')) { char b[128]; query(cmd, b, sizeof b); }
             else send_cmd(cmd);
             busy = 1;
         }
-        if (!dev) continue;
+        if (!linked()) continue;
         if (busy) {
             next_settings = 0; /* a change: read the settings straight away */
             sleep_ms(50);      /* let the scope act before its screen is taken */
         }
+        if (t - last_cycle < MIN_CYCLE_MS) sleep_ms((int)(MIN_CYCLE_MS - (t - last_cycle)));
+        last_cycle = now_ms();
         if (t >= next_settings) {
+            long t1 = now_ms();
+
             if (read_settings() == 0) {
-                next_settings = now_ms() + SETTINGS_MS;
+                /* every frame when the pass is quick (the LAN), else every 2 s */
+                next_settings = now_ms() - t1 < SETTINGS_FAST ? 0 : now_ms() + SETTINGS_MS;
                 publish();
             }
-            if (!dev) continue;
+            if (!linked()) continue;
         }
         fetch_frame();
     }
@@ -787,14 +1265,19 @@ static void worker(void)
         libusb_close(dev);
         dev = NULL;
     }
+    if (netf) {
+        fclose(netf);
+        netf = NULL;
+    }
     thread_done = 1;
 }
 
 /* ------------------------------------------------------------ interface */
 
-void scope_init(scope_state *s, int sim)
+void scope_init(scope_state *s, int sim, const char *host)
 {
     const char *tmp = getenv("TMPDIR");
+    char *p;
     int c;
 
 #ifdef _WIN32
@@ -807,24 +1290,58 @@ void scope_init(scope_state *s, int sim)
     memset(&st, 0, sizeof st);
     trace = getenv("MSO1104_TRACE") != NULL;
     st.sim = sim;
+    st.lan = host != NULL;
+    if (host) {
+        snprintf(lan_host, sizeof lan_host, "%s", host);
+        p = strrchr(lan_host, ':');
+        if (p && atoi(p + 1) > 0) { lan_port = atoi(p + 1); *p = 0; }
+    }
     for (c = 0; c < SCOPE_NCH; c++) { st.chscale[c] = 1; st.chprobe[c] = 10; }
     st.tscale = 1e-3;
     for (c = 0; c < 2; c++)
         snprintf(frame_path[c], sizeof frame_path[c], "%s/mso1104-%d-%c.bmp", tmp, (int)getpid(), 'a' + c);
     if (sim) sim_init();
+    else if (st.lan && lan_host[0]) set_status("Connecting to %s", lan_host);
+    else if (st.lan) set_status("Looking for the scope on the LAN");
     else set_status("Looking for the scope on USB");
     lk = ami_initlock();
     shared = st;
     shared_changed = 1;
     *s = st;
+    if (st.lan) {
+#ifndef _WIN32
+        signal(SIGPIPE, SIG_IGN);  /* a write to a scope that went away is an error, not a death */
+#endif
+        ami_neterror(net_error);   /* and so is a failed open */
+    }
     ami_newthread(worker);
 }
 
+/* Also the LAN watchdog. The link thread blocks for each reply with no
+   bound, so if the scope goes quiet it is this, the front panel's timer,
+   that notices: no new frame for STALE_MS while connected. The thread is
+   retired by bumping the generation and another is started; the old one
+   leaves when its read returns, which may be never, and that is fine. */
 int scope_poll(scope_state *s)
 {
-    int changed;
+    static unsigned last_seq;
+    static long     fresh_at;
+    int  changed, restart = 0;
+    long t = now_ms();
 
     ami_lock(lk);
+    if (shared.lan && shared.connected && !shared.sim) {
+        if (shared.frame_seq != last_seq || !fresh_at) { last_seq = shared.frame_seq; fresh_at = t; }
+        else if (t - fresh_at > STALE_MS) {
+            gen++;
+            shared.connected = 0;
+            shared.errors++;
+            snprintf(shared.status, sizeof shared.status, "No reply from %s: reconnecting", shared.host);
+            shared_changed = 1;
+            fresh_at = 0;
+            restart = 1;
+        }
+    } else fresh_at = 0;
     changed = shared_changed;
     if (changed) {
         shared.active = s->active;
@@ -832,6 +1349,7 @@ int scope_poll(scope_state *s)
         shared_changed = 0;
     }
     ami_unlock(lk);
+    if (restart) ami_newthread(worker);
     return changed;
 }
 
@@ -923,20 +1441,60 @@ void scope_vpos_zero(scope_state *s)
     enqueue(c);
 }
 
+/* libpng writes through this rather than its own stdio call: the FILE
+   comes from this program's stdio layer, which is not the one inside the
+   shared library (the AMI tool kit wraps stdio) */
+static void png_file_write(png_structp png, png_bytep data, png_size_t len)
+{
+    FILE *f = png_get_io_ptr(png);
+
+    if (fwrite(data, 1, len, f) != len) png_error(png, "write");
+}
+
+static void png_file_flush(png_structp png)
+{
+    (void)png;
+}
+
+/* the last picture, encoded as PNG with libpng */
 long scope_save_png(scope_state *s, const char *path)
 {
-    FILE *f;
-    long  n = 0;
+    FILE       *f;
+    uint8_t    *pix = NULL, **rows = NULL;
+    int         w, h, y;
+    long        n = 0;
+    png_structp png = NULL;
+    png_infop   info = NULL;
 
     (void)s;
     ami_lock(lk);
-    if (png_last && png_last_len) {
-        f = fopen(path, "wb");
-        if (f) {
-            n = (long)fwrite(png_last, 1, png_last_len, f);
-            fclose(f);
-        }
+    if (pix_last) {
+        pix = malloc((size_t)pix_w * pix_h * 3);
+        if (pix) memcpy(pix, pix_last, (size_t)pix_w * pix_h * 3);
+        w = pix_w; h = pix_h;
     }
     ami_unlock(lk);
+    if (!pix) return 0;
+    rows = malloc((size_t)h * sizeof *rows);
+    f = fopen(path, "wb");
+    if (!rows || !f) goto done;
+    for (y = 0; y < h; y++) rows[y] = pix + (size_t)y * w * 3;
+    png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (png) info = png_create_info_struct(png);
+    if (!info) goto done;
+    if (setjmp(png_jmpbuf(png))) goto done;
+    png_set_write_fn(png, f, png_file_write, png_file_flush);
+    png_set_IHDR(png, info, (png_uint_32)w, (png_uint_32)h, 8, PNG_COLOR_TYPE_RGB,
+                 PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png, info);
+    png_set_bgr(png);
+    png_write_image(png, rows);
+    png_write_end(png, NULL);
+    n = ftell(f);
+done:
+    if (png) png_destroy_write_struct(&png, info ? &info : NULL);
+    if (f) fclose(f);
+    free(rows);
+    free(pix);
     return n;
 }
