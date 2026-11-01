@@ -8,14 +8,16 @@
  * vertical section with the four channel keys and its knobs, the
  * horizontal section, the trigger section, and the power key, USB port,
  * logic pod and the four inputs along the bottom. The screen shows the
- * instrument's own display fetched over USB about once a second. Every key
- * sends the same key press the real one does and the knobs turn the real
- * knobs, so the scope's menus work as they do on the bench. Everything is
- * drawn with the AMI graphics calls and scaled to the window, so the panel
- * can be resized.
+ * instrument's own display, fetched over USB or the LAN about once a
+ * second. Every key sends the same key press the real one does and the
+ * knobs turn the real knobs, so the scope's menus work as they do on the
+ * bench. Everything is drawn with the AMI graphics calls and scaled to the
+ * window, so the panel can be resized.
  *
  * Use:
  *   mso1104             find the scope on USB
+ *   mso1104 --net       find the scope on the LAN (port 5555 on the subnet)
+ *   mso1104 --net HOST  the scope at that address or name, HOST[:port]
  *   mso1104 --sim       no hardware: a simulated scope
  *
  * Mouse: click a key to press it. Turn a knob by dragging it up or down,
@@ -210,7 +212,7 @@ static void save_shot(void)
     user_file(path, sizeof path, "Desktop", name, "png");
     n = scope_save_png(&sc, path);
     if (n > 0) snprintf(msg, sizeof msg, "Saved screen to Desktop/%s.png", name);
-    else snprintf(msg, sizeof msg, sc.sim ? "No PNG from the simulator" : "No screen to save yet");
+    else snprintf(msg, sizeof msg, "No screen to save yet");
     set_note(msg);
 }
 
@@ -589,7 +591,10 @@ static void draw_status(void)
     frrect(2, y1, PANW - 2, y2, 6);
     font(AMI_FONT_SIGN, 11, TRUE);
     if (sc.sim) { color(230, 180, 40); snprintf(buf, sizeof buf, "SIMULATED"); }
-    else if (sc.connected) { color(40, 200, 90); snprintf(buf, sizeof buf, "%s  %s", sc.model, sc.serial); }
+    else if (sc.connected) {
+        color(40, 200, 90);
+        snprintf(buf, sizeof buf, "%s  %s  %s", sc.model, sc.serial, sc.lan ? sc.host : "USB");
+    }
     else { color(235, 120, 80); snprintf(buf, sizeof buf, "%s", sc.status); }
     text(14, y1 + 9, -1, buf);
     if (sc.have_settings && sc.connected) {
@@ -839,7 +844,9 @@ static void run_script(void)
 
 static void usage(const char *prog)
 {
-    fprintf(stderr, "usage: %s [--sim]\n", prog);
+    fprintf(stderr, "usage: %s [--sim] [--net [host[:port]]]\n"
+                    "  --net        find the scope on the LAN, or at host (SCPI port %d)\n"
+                    "  --sim        a simulated scope, no hardware\n", prog, SCOPE_PORT);
     exit(1);
 }
 
@@ -848,11 +855,15 @@ int main(int argc, char *argv[])
     ami_evtrec er;
     ami_long   wx, wy;
     int sim = 0, i, id, dirty;
+    const char *host = NULL; /* NULL USB, "" find on the LAN, else an address */
     char title[160];
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--sim") || !strcmp(argv[i], "-s")) sim = 1;
-        else usage(argv[0]);
+        else if (!strcmp(argv[i], "--net") || !strcmp(argv[i], "-n")) {
+            host = "";
+            if (i + 1 < argc && argv[i + 1][0] != '-') host = argv[++i];
+        } else usage(argv[0]);
     }
     for (i = 0; i < H_LAST; i++) angle[i] = -2.2;
 #ifdef SHOT
@@ -861,12 +872,14 @@ int main(int argc, char *argv[])
     script = getenv("MSO1104_SCRIPT");
     if (script) script_at = now_ms() + 1000;
 #endif
-    scope_init(&sc, sim);
+    scope_init(&sc, sim, host);
     ami_autohold(FALSE);
     ami_auto(stdout, FALSE);
     ami_curvis(stdout, FALSE);
     ami_binvis(stdout);
-    snprintf(title, sizeof title, "MSO1104%s", sim ? " (simulated)" : "");
+    if (sim) snprintf(title, sizeof title, "MSO1104 (simulated)");
+    else if (host && *host) snprintf(title, sizeof title, "MSO1104 (LAN %s)", host);
+    else snprintf(title, sizeof title, "MSO1104%s", host ? " (LAN)" : "");
     ami_title(stdout, title);
     ami_autobuf(stdout, FALSE);
     ami_winclientg(stdout, WINW, WINH, &wx, &wy,

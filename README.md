@@ -1,10 +1,10 @@
 # MSO1104 front panel
 
 A remote control for the Rigol MSO1104Z and DS1104Z oscilloscopes, and the
-rest of the DS1000Z / MSO1000Z family. It drives the scope over its USB port
-and is written in C using the AMI tool kit. The window is drawn to look like
+rest of the DS1000Z / MSO1000Z family. It drives the scope over its USB
+port or its LAN port and is written in C using the AMI tool kit. The window is drawn to look like
 the front of the scope: the screen at the left shows the instrument's own
-display, fetched about once a second, and the keys and knobs around it work
+display, fetched about twice a second, and the keys and knobs around it work
 the real ones. The scope's menus, cursors, measurements and so on are all
 driven through its own screen, so the panel is a remote control rather than
 a re-implementation.
@@ -26,6 +26,8 @@ command set, so they work the same; only the badge is different.
     make                     # needs ~/projects/amitk built (or set AMIDIR),
                              # libusb-1.0 and libpng
     ./mso1104                # finds the scope on USB
+    ./mso1104 --net          # finds the scope on the LAN
+    ./mso1104 --net 10.0.0.5 # the scope at that address (or name, host:port)
     ./mso1104 --sim          # no hardware: a simulated scope
     make sim                 # same as ./mso1104 --sim
 
@@ -40,6 +42,17 @@ libusb and libpng come from Homebrew (`brew install libusb libpng`) and no
 driver work is needed; the same `make` builds there. The program looks for
 the scope every 2 s, so it can be plugged in after starting, and it
 reconnects after a cable pull.
+
+Over the LAN the scope listens on TCP port 5555 (raw SCPI, no VISA or
+VXI-11 needed) once its LAN port is enabled under Utility > IO Setting.
+`--net` alone searches for it: every address on each local subnet (up to
+a /22) is tried on port 5555 at once, and the first that answers `*IDN?`
+with a Rigol is used; the search takes about a second. `--net` with an
+address or host name, optionally `:port`, probes that one. The status
+strip shows the address in use. The same 2 s retry applies, so the scope
+can be switched on later. If the scope stops answering, the panel notices
+no picture has come for 10 s and starts the link again, searching again
+if that is how it was found.
 
 ## Using it
 
@@ -94,17 +107,31 @@ show up, the picture rate, and brief messages.
 
 ## Protocol
 
-USBTMC over libusb, bulk transfers only, SCPI commands. Besides the
-documented command set the scope accepts these, found by trying:
+SCPI commands, over USBTMC (libusb, bulk transfers only) or over the raw
+socket on the LAN port. Besides the documented command set the scope
+accepts these, found by trying:
 
 | Command | Meaning |
 |---|---|
 | `:SYST:KEY:PRES <key>` | Press a key. Keys: `CH1`..`CH4` `MATH` `REF` `LA` `MEAS` `ACQ` `STOR` `CURS` `DISP` `UTIL` `HELP` `SOUR` `RSTOP` `SING` `TFOR` `CLE` `HMEN` `TMEN` `F1`..`F6` |
 | `:SYST:KEY:INCR <knob>,1` | Turn a knob one detent clockwise. Knobs: `HSC` `HPOS` `TLEV` |
 | `:SYST:KEY:DECR <knob>,1` | One detent anticlockwise |
-| `:DISP:DATA? ON,OFF,PNG` | The screen as a PNG in an IEEE 488.2 block |
+| `:DISP:DATA? ON,OFF,TIFF` | The screen as a TIFF in an IEEE 488.2 block |
+| `:DISP:DATA? ON,OFF,PNG` | The same as a PNG |
 
-Two things about the instrument's USB shape the link code in `scope.c`:
+The LAN side is plain: a command line goes in, a line comes back, or an
+IEEE 488.2 block followed by a newline for the screen picture. Finding
+the scope is a probe with its own sockets and short timeouts, since it
+tries a subnet's worth of addresses at once. Once the scope has answered,
+the link itself is an AMI network stream (`ami_opennetname`) read and
+written with stdio, and the link thread simply blocks for each reply, as
+the tool kit's design intends: a request and reply protocol on one stream
+wants one thread and no readiness polling. No timeout bounds those waits.
+Instead the front panel, which has a timer anyway, watches for the
+pictures to stop; after 10 s it retires the link thread by generation
+number and starts another, and the old one leaves when its read finally
+returns, which may be never. The USB side is where the work is. Two
+things about the instrument's USB shape the link code in `scope.c`:
 
 - It sends 64 byte bulk packets although it enumerates at high speed, so
   the host sees every packet as a short packet. Replies are gathered piece
@@ -116,15 +143,30 @@ Two things about the instrument's USB shape the link code in `scope.c`:
   scope's USB stack until the cable is pulled. Only bulk transfers are
   used, and a half finished transfer is cleared with a USB port reset.
 
-The screen picture (35 to 50 kB of PNG) takes about 1.2 s to arrive. It is
-decoded with libpng and written as a 24 bit BMP, the picture format the AMI
-graphics module loads, into two alternating files under `$TMPDIR`.
+The screen picture is asked for as TIFF, which the scope produces in a
+steady 0.45 s, where its PNG takes 0.8 to 1.6 s and its JPEG over 3 s; the
+pictures are identical pixel for pixel. The TIFF is 8 bit RGB in LZW
+strips, about 47 kB, and `tiff.c` reads just that shape, so no TIFF library
+is needed. If the TIFF fetch or decode fails twice (older firmware, say)
+the program switches to PNG, decoded with libpng. Either way the picture
+is written as a 24 bit BMP, the picture format the AMI graphics module
+loads, into two alternating files under `$TMPDIR`, and kept as pixels so
+that SAVE PNG can encode it with libpng.
+
+After a picture the scope holds its next command, whatever it is, for
+about 350 ms two times in three, so a frame costs about 0.8 s all told and
+the panel shows a little over one a second. The settings the panel uses
+(timebase, the four channels' display, scale, offset and probe, and the
+trigger level, source, state and sweep: 21 queries at about 1 ms each
+over the LAN) are read after every frame when a pass takes under 100 ms,
+and every 2 s otherwise.
 
 ## Files
 
 - `mso1104.c`: the front panel (drawing, input).
-- `scope.c`, `scope.h`: the USB link, its thread and command queue, the
-  picture conversion, and the simulator.
+- `scope.c`, `scope.h`: the USB and LAN links, the LAN probe, the link
+  thread and command queue, the picture conversion, and the simulator.
+- `tiff.c`, `tiff.h`: the reader for the scope's TIFF screen picture.
 - `make shot` builds `mso1104_shot`, a test version that takes pictures of
   its own window (`MSO1104_SHOT=<file>`) and can run scripted key presses
   and knob turns (`MSO1104_SCRIPT=CH3,HSC-,TLEV+`).
