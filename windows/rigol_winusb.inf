@@ -1,0 +1,44 @@
+; Binds the Rigol DS1000Z / MSO1000Z family scope (USB 1AB1:04CE) to the
+; WinUSB driver that ships with Windows, so that libusb can open it. This is
+; what Zadig does; install_winusb.ps1 beside this file signs and installs it.
+
+[Version]
+Signature="$Windows NT$"
+Class=USBDevice
+ClassGUID={88BAE032-5A81-49f6-BC3C-D8E12A7D5B4E}
+Provider=%ProviderName%
+CatalogFile=rigol_winusb.cat
+DriverVer=10/31/2026,1.0.0.1
+
+; the USBDevice class is not registered until a device of it is installed,
+; so the package registers it, as Zadig's does
+[ClassInstall32]
+AddReg=ClassInstall_AddReg
+
+[ClassInstall_AddReg]
+HKR,,,,"Universal Serial Bus devices"
+HKR,,Icon,,"-20"
+
+[Manufacturer]
+%ProviderName%=Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName%=USB_Install, USB\VID_1AB1&PID_04CE
+
+[USB_Install]
+Include=winusb.inf
+Needs=WINUSB.NT
+
+[USB_Install.Services]
+Include=winusb.inf
+Needs=WINUSB.NT.Services
+
+[USB_Install.HW]
+AddReg=Dev_AddReg
+
+[Dev_AddReg]
+HKR,,DeviceInterfaceGUIDs,0x10000,"{7c3a4a1e-0b2d-4c5f-9e8a-2f1d6b7c8e90}"
+
+[Strings]
+ProviderName="MSO1104 front panel"
+DeviceName="Rigol DS1000Z Series (WinUSB)"

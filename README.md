@@ -41,6 +41,59 @@ driver work is needed; the same `make` builds there. The program looks for
 the scope every 2 s, so it can be plugged in after starting, and it
 reconnects after a cable pull.
 
+### Windows
+
+The build is MinGW gcc from [MSYS2](https://www.msys2.org), the same
+toolchain that builds amitk there, from the MSYS2 MinGW 64-bit shell:
+
+    pacman -S --needed mingw-w64-x86_64-libusb mingw-w64-x86_64-libpng
+    make                     # expects amitk built in ../amitk, or set AMIDIR
+    ./mso1104.exe --sim
+
+The executable is static apart from the system DLLs, so it runs from
+anywhere once built. `amitk`'s own `setpath.bat` does not set `AMIDIR`, so
+on Windows the Makefile defaults to a sister directory `../amitk`; set
+`AMIDIR` if the tool kit lives elsewhere.
+
+To talk to the real scope the device has to be bound to the WinUSB driver,
+which is what libusb opens on Windows. Out of the box Windows leaves the
+scope without a driver (Device Manager shows "DS1000Z Series" with a
+warning), or, if NI-VISA or Rigol's UltraSigma is installed, binds it to
+their usbtmc driver, which libusb cannot use. A scope with no driver is
+invisible to libusb, so the panel just says no scope was found; one held by
+a usbtmc driver is seen but not opened, and the status strip says so.
+
+Binding it to WinUSB is a one time step per machine, done either way:
+
+    powershell -ExecutionPolicy Bypass -File windows\install_winusb.ps1
+
+installs `windows/rigol_winusb.inf`, a package that names the WinUSB driver
+Windows already has. Windows will not install an unsigned package, so the
+script does what Zadig does: it signs the package with a throwaway
+self-signed certificate, trusts that for the moment of the install, and
+removes it again. It asks for administrator rights itself. It wants
+`makecat` from the Windows SDK to make the catalog and falls back to
+PowerShell's `New-FileCatalog` without it. The alternative is
+[Zadig](https://zadig.akeo.ie): choose "DS1000Z Series" (USB ID `1AB1
+04CE`), with *Options > List All Devices* if it is not shown, select
+*WinUSB* and press *Install Driver*. Going back to a VISA driver is an
+uninstall of the device in Device Manager with "delete the driver
+software" ticked, or `pnputil /delete-driver oemNN.inf /uninstall /force`
+with the package `pnputil /enum-drivers` lists for `rigol_winusb.inf`.
+
+The saved screen pictures go to the Desktop folder of the user profile,
+`%USERPROFILE%\Desktop`, named as on the other systems.
+
+### If it is slow
+
+The screen comes about 1.5 times a second on Windows: the scope takes
+0.63 s to render each PNG, and the transfer itself is a few milliseconds.
+AUTO stops the scope answering for about 6 s, and the panel waits that
+out. If the picture stalls for longer, run with `MSO1104_TRACE=1` set in
+the environment: the panel then logs every frame's fetch and decode time,
+any reply that took over 100 ms, and any link loss to stderr, on every
+platform.
+
 ## Using it
 
 | Control | Action |
