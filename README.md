@@ -45,9 +45,14 @@ reconnects after a cable pull.
 
 Over the LAN the scope listens on TCP port 5555 (raw SCPI, no VISA or
 VXI-11 needed) once its LAN port is enabled under Utility > IO Setting.
-`--net` alone searches for it: every address on each local subnet (up to
-a /22) is tried on port 5555 at once, and the first that answers `*IDN?`
-with a Rigol is used; the search takes about a second. `--net` with an
+`--net` alone searches for it in two ways at once. A VXI-11 discovery
+request is broadcast on each local subnet: the scope is an LXI instrument
+as well, and every instrument on the subnet answers with the port of its
+VXI-11 service, the DS1000Z within about 100 ms. As a fallback, every
+address of each subnet of /22 or smaller is tried on port 5555 at once.
+Whatever answers either way is asked `*IDN?` on port 5555, and the first
+Rigol is used. Finding the scope takes a fraction of a second; a search
+that finds nothing takes about two. `--net` with an
 address or host name, optionally `:port`, probes that one. The status
 strip shows the address in use. The same 2 s retry applies, so the scope
 can be switched on later. If the scope stops answering, the panel notices
@@ -101,9 +106,10 @@ The LAN link works on Windows as on the other systems: `--net` alone
 searches the subnets of the adapters that are up (Winsock, with the
 adapters listed by `GetAdaptersAddresses`), and `--net HOST` probes one
 address. Virtual adapters (VirtualBox, VMware, Hyper-V, WSL) have subnets
-of their own, which are searched too; each adds about a second when the
-scope is not on it. Windows Firewall does not stop the search, since it is
-outgoing connections only.
+of their own, which are searched too, and lengthen a search that finds
+nothing. Windows Firewall does not stop the search: the broadcast and the
+connects go out, and the answers come back to the socket that asked,
+which the firewall lets through as replies.
 
 ### If it is slow
 
@@ -183,8 +189,16 @@ accepts these, found by trying:
 
 The LAN side is plain: a command line goes in, a line comes back, or an
 IEEE 488.2 block followed by a newline for the screen picture. Finding
-the scope is a probe with its own sockets and short timeouts, since it
-tries a subnet's worth of addresses at once. Once the scope has answered,
+the scope is a probe with its own sockets and short timeouts. It is an
+ONC RPC portmapper `GETPORT` call for the VXI-11 core program (`0x0607AF`,
+TCP), broadcast to UDP port 111 of each subnet, which every VXI-11
+instrument answers with the port of that service and a host with a bare
+portmapper answers with port 0; and, as a fallback for a scope with no
+VXI-11 answer, a connect to port 5555 of a subnet's worth of addresses at
+once. Either way `*IDN?` on port 5555 settles it. The scope answers the
+broadcast in about 100 ms, as long as each request carries a transaction
+id it has not seen: it keeps a duplicate request cache and answers a
+repeated id only seconds later. Once the scope has answered,
 the link itself is an AMI network stream (`ami_opennetname`) read and
 written with stdio, and the link thread simply blocks for each reply, as
 the tool kit's design intends: a request and reply protocol on one stream
