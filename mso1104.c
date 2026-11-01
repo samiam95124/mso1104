@@ -926,6 +926,9 @@ int main(int argc, char *argv[])
                 break;
             case ami_etmouba:
                 id = hit(mx, my);
+                if (trace) fprintf(stderr, "panel: button %d at %d,%d (event %ld,%ld; window %ld x %ld) hits %d\n",
+                                   (int)er.amoubn, mx, my, (long)er.moupxg, (long)er.moupyg,
+                                   (long)ami_maxxg(stdout), (long)ami_maxyg(stdout), id);
                 if (er.amoubn == 4 || er.amoubn == 5) {
                     turn(is_knob(id) ? id : last_knob, er.amoubn == 4 ? 1 : -1);
                     break;
