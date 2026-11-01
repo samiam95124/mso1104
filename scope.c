@@ -4,8 +4,10 @@
  * Two transports. Over the LAN the scope's raw SCPI socket (TCP port 5555)
  * takes a command line and answers with a line, or with an IEEE 488.2 block
  * followed by a newline. Finding the scope is a probe with its own short
- * timeouts: port 5555 on every host of the local subnet at once (or on the
- * address given), and *IDN? of each that answers. Once found, the link is
+ * timeouts: a VXI-11 portmapper broadcast, which every instrument on the
+ * subnet answers, and port 5555 on every host of the subnet at once as a
+ * fallback (or on the address given), then *IDN? of whatever answers.
+ * Once found, the link is
  * an AMI network stream (ami_opennetname) and plain stdio, and the thread
  * blocks on it for each reply, as the tool kit intends: a request and
  * reply protocol on one stream needs one thread and no readiness polling.
@@ -75,6 +77,7 @@
 #include <winsock2.h>   /* before windows.h, which the others pull in */
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
+#include <mswsock.h>   /* SIO_UDP_CONNRESET */
 #endif
 #include <libusb.h>
 #include <png.h>
@@ -100,7 +103,10 @@
 #define MIN_CYCLE_MS  100     /* a link faster than this would swamp the window */
 #define PROBE_MS      500     /* LAN search: connect timeout per batch */
 #define PROBE_BATCH   128     /* LAN search: hosts tried at once */
-#define PROBE_MAX     1024    /* LAN search: largest subnet tried */
+#define PROBE_MAX     1024    /* LAN search: largest subnet swept */
+#define DISCOVER_HEAD 200     /* LAN search: head start the VXI-11 answers get
+                                 before the sweep; the scope takes about 100 ms */
+#define DISCOVER_MS   2000    /* LAN search: how long to wait for them in all */
 #define SCREEN_W      800
 #define SCREEN_H      480
 
@@ -496,28 +502,25 @@ static int is_rigol(int fd, int timeout, char *idn, size_t idnlen)
     return strstr(idn, "RIGOL") != NULL;
 }
 
-/* One interface's subnet, as the machine's address and the mask in host
-   order: if it is of a size worth searching, add every other host of it
-   to the candidates. Returns the list, grown; *ncand counts it. The first
-   subnet taken names the search in subnet, for the status line. */
-static struct sockaddr_in *add_subnet(struct sockaddr_in *cand, int *ncand, unsigned long mine,
-                                      unsigned long mask, char *subnet, size_t subnetlen)
+/* an interface's own address and its mask, in host order */
+typedef struct {
+    unsigned long addr, mask;
+} ifnet;
+
+/* One interface's subnet: if it is of a size worth sweeping, add every
+   other host of it to the candidates. Returns the list, grown; *ncand
+   counts it. */
+static struct sockaddr_in *add_subnet(struct sockaddr_in *cand, int *ncand, const ifnet *ifn)
 {
-    unsigned long net = mine & mask, hosts = ~mask & 0xffffffffUL, a;
+    unsigned long net = ifn->addr & ifn->mask, hosts = ~ifn->mask & 0xffffffffUL, a;
     struct sockaddr_in *nc;
 
     if (hosts < 2 || hosts > PROBE_MAX) return cand; /* a point to point link, or too big */
     nc = realloc(cand, (*ncand + hosts) * sizeof *cand);
     if (!nc) return cand;
     cand = nc;
-    if (!subnet[0]) {
-        int bits = 32;
-
-        for (a = hosts; a; a >>= 1) bits--;
-        snprintf(subnet, subnetlen, "%lu.%lu.%lu.%lu/%d", net >> 24, (net >> 16) & 255, (net >> 8) & 255, net & 255, bits);
-    }
     for (a = net + 1; a < net + hosts; a++) {
-        if (a == mine) continue;
+        if (a == ifn->addr) continue;
         memset(&cand[*ncand], 0, sizeof cand[*ncand]);
         cand[*ncand].sin_family = AF_INET;
         cand[*ncand].sin_port = htons((uint16_t)lan_port);
@@ -527,11 +530,33 @@ static struct sockaddr_in *add_subnet(struct sockaddr_in *cand, int *ncand, unsi
     return cand;
 }
 
-/* The subnets of the machine's own interfaces that are up, other than the
-   loopback, as candidates. 0, or -1 with the status set if the interfaces
-   cannot be listed. */
+/* name a subnet, a.b.c.d/bits, for the status line */
+static void subnet_name(const ifnet *ifn, char *out, size_t outlen)
+{
+    unsigned long net = ifn->addr & ifn->mask, a;
+    int bits = 32;
+
+    for (a = ~ifn->mask & 0xffffffffUL; a; a >>= 1) bits--;
+    snprintf(out, outlen, "%lu.%lu.%lu.%lu/%d", net >> 24, (net >> 16) & 255, (net >> 8) & 255, net & 255, bits);
+}
+
+/* append an interface to the list */
+static ifnet *add_ifnet(ifnet *ifs, int *nifs, unsigned long addr, unsigned long mask)
+{
+    ifnet *ni = realloc(ifs, (*nifs + 1) * sizeof *ifs);
+
+    if (!ni) return ifs;
+    ifs = ni;
+    ifs[*nifs].addr = addr;
+    ifs[*nifs].mask = mask;
+    (*nifs)++;
+    return ifs;
+}
+
+/* The machine's own IPv4 interfaces that are up, other than the loopback.
+   0, or -1 with the status set if they cannot be listed. */
 #ifndef _WIN32
-static int local_subnets(struct sockaddr_in **cand, int *ncand, char *subnet, size_t subnetlen)
+static int local_ifnets(ifnet **ifs, int *nifs)
 {
     struct ifaddrs     *ifa, *p;
     struct sockaddr_in *sa, *nm;
@@ -545,13 +570,13 @@ static int local_subnets(struct sockaddr_in **cand, int *ncand, char *subnet, si
         if (p->ifa_flags & IFF_LOOPBACK || !(p->ifa_flags & IFF_UP)) continue;
         sa = (struct sockaddr_in *)p->ifa_addr;
         nm = (struct sockaddr_in *)p->ifa_netmask;
-        *cand = add_subnet(*cand, ncand, ntohl(sa->sin_addr.s_addr), ntohl(nm->sin_addr.s_addr), subnet, subnetlen);
+        *ifs = add_ifnet(*ifs, nifs, ntohl(sa->sin_addr.s_addr), ntohl(nm->sin_addr.s_addr));
     }
     freeifaddrs(ifa);
     return 0;
 }
 #else
-static int local_subnets(struct sockaddr_in **cand, int *ncand, char *subnet, size_t subnetlen)
+static int local_ifnets(ifnet **ifs, int *nifs)
 {
     IP_ADAPTER_ADDRESSES       *aa = NULL, *na, *p;
     IP_ADAPTER_UNICAST_ADDRESS *u;
@@ -587,8 +612,7 @@ static int local_subnets(struct sockaddr_in **cand, int *ncand, char *subnet, si
             mask = u->OnLinkPrefixLength >= 32 ? 0xffffffffUL
                  : u->OnLinkPrefixLength == 0 ? 0
                  : (0xffffffffUL << (32 - u->OnLinkPrefixLength)) & 0xffffffffUL;
-            *cand = add_subnet(*cand, ncand, ntohl(((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr.s_addr),
-                               mask, subnet, subnetlen);
+            *ifs = add_ifnet(*ifs, nifs, ntohl(((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr.s_addr), mask);
         }
     }
     free(aa);
@@ -596,26 +620,192 @@ static int local_subnets(struct sockaddr_in **cand, int *ncand, char *subnet, si
 }
 #endif
 
-/* Search the local subnets for a Rigol on the SCPI port. Sets host and
-   returns 0, or -1 with the status set. */
+/* ------------------------------------------------------------ vxi-11 discovery */
+
+/* The scope is also a VXI-11 (LXI) instrument, and those register their
+   core service with an ONC RPC portmapper on UDP port 111. A GETPORT
+   request for the VXI-11 core program, broadcast to the subnet, is
+   answered by every instrument on it with the port it listens on; a host
+   with a portmapper but no instrument answers with port 0. One packet per
+   interface finds a scope on a subnet of any size, where the connect sweep
+   is limited to a /22, and the DS1000Z answers within about 100 ms. So the
+   request goes out first and is given a short head start; then the sweep
+   runs, looking between batches for an answer; and when the sweep has
+   found nothing, or there was no subnet small enough to sweep, the search
+   waits out the rest of DISCOVER_MS for one. An instrument that answers is
+   verified like any other candidate: *IDN? on the SCPI port. Each attempt
+   uses a fresh transaction id. The scope keeps a duplicate request cache
+   keyed on it, and answers a repeated id only after a second or three,
+   which looked like a slow portmapper until the cause was found. */
+
+#define PMAP_PORT     111
+#define PMAP_PROG     100000
+#define PMAP_GETPORT  3
+#define VXI11_CORE    0x0607AF
+#define DISCOVER_MAX  16        /* interfaces asked, at most */
+
+static void put32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
+}
+
+static uint32_t get32(const uint8_t *p)
+{
+    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+/* Send the GETPORT request out of each interface: a UDP socket per
+   interface, bound to its address so the answers come back to it, to the
+   subnet's own broadcast address and to the all-ones one. The sockets
+   are returned in socks for discover_wait; their number is returned. */
+static int discover_start(const ifnet *ifs, int nifs, int *socks, uint32_t xid)
+{
+    uint8_t  req[56];
+    uint32_t words[14] = { 0, 0, 2, PMAP_PROG, 2, PMAP_GETPORT, /* xid, CALL, RPC version, program, version, procedure */
+                           0, 0, 0, 0,                          /* credentials and verifier: AUTH_NULL, empty */
+                           VXI11_CORE, 1, 6, 0 };               /* program, version, TCP, port (unused) */
+    struct sockaddr_in to, me;
+    int i, s, n = 0, one = 1;
+
+    words[0] = xid;
+    for (i = 0; i < 14; i++) put32(req + 4 * i, words[i]);
+    memset(&to, 0, sizeof to);
+    to.sin_family = AF_INET;
+    to.sin_port = htons(PMAP_PORT);
+    for (i = 0; i < nifs && n < DISCOVER_MAX; i++) {
+        s = (int)socket(AF_INET, SOCK_DGRAM, 0);
+        if (s < 0) continue;
+        setsockopt(s, SOL_SOCKET, SO_BROADCAST, (const char *)&one, sizeof one);
+#ifdef _WIN32
+        {   /* or an ICMP port unreachable from any host makes the next recvfrom fail */
+            DWORD off = 0, got;
+
+            WSAIoctl((SOCKET)s, SIO_UDP_CONNRESET, &off, sizeof off, NULL, 0, &got, NULL, NULL);
+        }
+#endif
+        memset(&me, 0, sizeof me);
+        me.sin_family = AF_INET;
+        me.sin_addr.s_addr = htonl(ifs[i].addr);
+        bind(s, (const struct sockaddr *)&me, sizeof me); /* if it fails the socket is unbound, still usable */
+        sock_block(s, 0);
+        to.sin_addr.s_addr = htonl(ifs[i].addr | (~ifs[i].mask & 0xffffffffUL));
+        sendto(s, (const char *)req, sizeof req, 0, (const struct sockaddr *)&to, sizeof to);
+        to.sin_addr.s_addr = htonl(0xffffffffUL);
+        sendto(s, (const char *)req, sizeof req, 0, (const struct sockaddr *)&to, sizeof to);
+        socks[n++] = s;
+    }
+    return n;
+}
+
+/* one datagram from a discovery socket: the address of a VXI-11
+   instrument answering our request, or 0 */
+static unsigned long discover_reply(int s, uint32_t xid)
+{
+    uint8_t   buf[256];
+    struct sockaddr_in from;
+    socklen_t fl = sizeof from;
+    int       n, off;
+    uint32_t  port;
+
+    n = (int)recvfrom(s, (char *)buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
+    if (n < 24 || get32(buf) != xid) return 0;
+    if (get32(buf + 4) != 1 || get32(buf + 8) != 0) return 0;  /* a REPLY, accepted */
+    off = 20 + (int)((get32(buf + 16) + 3) & ~3u);              /* over the verifier */
+    if (n < off + 8 || get32(buf + off) != 0) return 0;         /* executed successfully */
+    port = get32(buf + off + 4);
+    if (trace) fprintf(stderr, "scope: %ld: portmapper at %s: VXI-11 port %u\n", now_ms() % 100000, inet_ntoa(from.sin_addr), port);
+    return port ? ntohl(from.sin_addr.s_addr) : 0;
+}
+
+/* wait up to timeout ms for an instrument to answer on any of the
+   discovery sockets: its address, or 0 */
+static unsigned long discover_wait(const int *socks, int n, uint32_t xid, int timeout)
+{
+    struct pollfd pf[DISCOVER_MAX];
+    long  end = now_ms() + timeout, t;
+    unsigned long a;
+    int   i;
+
+    if (n <= 0) return 0;
+    for (;;) {
+        for (i = 0; i < n; i++) {
+            pf[i].fd = socks[i];
+            pf[i].events = POLLIN;
+            pf[i].revents = 0;
+        }
+        t = end - now_ms();
+        if (t < 0) t = 0;
+        if (poll(pf, (nfds_t)n, (int)t) <= 0) return 0;
+        for (i = 0; i < n; i++)
+            if (pf[i].revents && (a = discover_reply(socks[i], xid)) != 0) return a;
+        if (t == 0) return 0; /* a datagram that was not an answer, and no time to wait for another */
+    }
+}
+
+/* An instrument found by discovery: does a Rigol answer on the SCPI port
+   there? 0 and host set if so; -1 if nothing listens on the port, -2 if
+   something else does. */
+static int verify_found(unsigned long a, char *host, size_t hostlen)
+{
+    struct sockaddr_in sa;
+    char idn[160];
+    int  fd, ok;
+
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)lan_port);
+    sa.sin_addr.s_addr = htonl(a);
+    snprintf(host, hostlen, "%s", inet_ntoa(sa.sin_addr));
+    connect_batch(&sa, 1, CONNECT_MS, &fd);
+    if (fd < 0) return -1;
+    ok = is_rigol(fd, 1000, idn, sizeof idn);
+    sock_close(fd);
+    return ok ? 0 : -2;
+}
+
+/* Search the local subnets for a Rigol on the SCPI port: the VXI-11
+   broadcast and the connect sweep together, as described above. Sets
+   host and returns 0, or -1 with the status set. */
 static int find_lan_scope(char *host, size_t hostlen)
 {
+    ifnet  *ifs = NULL;
     struct sockaddr_in *cand = NULL;
-    int    ncand = 0, i, n, k, fds[PROBE_BATCH], found = -1;
-    char   idn[160], subnet[32] = "";
+    int    nifs = 0, ncand = 0, nsock = 0, ntried = 0, i, n = 0, k, r;
+    int    fds[PROBE_BATCH], socks[DISCOVER_MAX], found = -1;
+    unsigned long a, tried[8], noport = 0;
+    uint32_t xid;
+    char   idn[160], subnet[32], other[32] = "";
+    long   start = now_ms(), t;
 
-    if (local_subnets(&cand, &ncand, subnet, sizeof subnet) < 0) {
-        free(cand);
+    if (local_ifnets(&ifs, &nifs) < 0) return -1;
+    if (nifs == 0) {
+        set_status("No network interface is up: give the address");
         return -1;
     }
-    if (ncand == 0) {
-        set_status("No LAN to search (no subnet of /22 or smaller): give the address");
-        free(cand);
-        return -1;
-    }
-    set_status("Looking for the scope on %s", subnet);
+    for (i = 0; i < nifs; i++) cand = add_subnet(cand, &ncand, &ifs[i]);
+    subnet_name(&ifs[0], subnet, sizeof subnet);
+    if (nifs > 1) snprintf(other, sizeof other, " and %d other%s", nifs - 1, nifs > 2 ? "s" : "");
+    set_status("Looking for the scope on %s%s", subnet, other);
     publish();
-    for (i = 0; i < ncand && found < 0 && !stop_req; i += n) {
+    xid = (uint32_t)start * 2654435761u | 1;
+    nsock = discover_start(ifs, nifs, socks, xid);
+    free(ifs);
+
+    /* a head start for the broadcast; the sweep, looking between batches
+       for an instrument that has answered meanwhile; then a wait for one,
+       if the sweep found nothing or there was no subnet small enough */
+    for (i = 0; found < 0 && !stop_req; i += n) {
+        t = i < ncand ? (i == 0 ? DISCOVER_HEAD : 0) : start + DISCOVER_MS - now_ms();
+        while (found < 0 && (a = discover_wait(socks, nsock, xid, (int)t)) != 0) {
+            for (k = 0; k < ntried && tried[k] != a; k++) ;
+            if (k < ntried) continue; /* answered twice: the two broadcasts */
+            if (ntried < 8) tried[ntried++] = a;
+            r = verify_found(a, host, hostlen);
+            if (r == 0) found = 0;
+            else if (r == -1) noport = a;
+            t = i < ncand ? (i == 0 ? DISCOVER_HEAD : 0) : start + DISCOVER_MS - now_ms();
+        }
+        if (found >= 0 || i >= ncand || t < 0) break;
         n = ncand - i < PROBE_BATCH ? ncand - i : PROBE_BATCH;
         connect_batch(cand + i, n, PROBE_MS, fds);
         for (k = 0; k < n; k++) {
@@ -627,8 +817,16 @@ static int find_lan_scope(char *host, size_t hostlen)
             sock_close(fds[k]);
         }
     }
+    for (i = 0; i < nsock; i++) sock_close(socks[i]);
     free(cand);
-    if (found < 0) set_status("No scope found on %s", subnet);
+    if (found < 0) {
+        if (noport) {
+            struct in_addr ia;
+
+            ia.s_addr = htonl(noport);
+            set_status("An instrument at %s answers VXI-11 but not port %d", inet_ntoa(ia), lan_port);
+        } else set_status("No scope found on %s%s", subnet, other);
+    }
     return found;
 }
 
