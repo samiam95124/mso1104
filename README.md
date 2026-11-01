@@ -97,9 +97,13 @@ with the package `pnputil /enum-drivers` lists for `rigol_winusb.inf`.
 The saved screen pictures go to the Desktop folder of the user profile,
 `%USERPROFILE%\Desktop`, named as on the other systems.
 
-The LAN link works on Windows through the tool kit's network module, but
-the subnet search is not built there (it is written on POSIX sockets), so
-give the scope's address: `./mso1104.exe --net HOST`.
+The LAN link works on Windows as on the other systems: `--net` alone
+searches the subnets of the adapters that are up (Winsock, with the
+adapters listed by `GetAdaptersAddresses`), and `--net HOST` probes one
+address. Virtual adapters (VirtualBox, VMware, Hyper-V, WSL) have subnets
+of their own, which are searched too; each adds about a second when the
+scope is not on it. Windows Firewall does not stop the search, since it is
+outgoing connections only.
 
 ### If it is slow
 

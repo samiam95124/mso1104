@@ -30,7 +30,7 @@ ifeq ($(OSTYPE),Windows_NT)
     # (STDIO_BYPASS), so the program is compiled the same way.
     INCS = $(shell pkg-config --cflags libusb-1.0 libpng) -DSTDIO_BYPASS
     LIBS = $(shell pkg-config --libs --static libusb-1.0 libpng) -lz \
-           -lwinmm -lgdi32 -lcomdlg32 -lssl -lcrypto -lws2_32 -lcrypt32
+           -lwinmm -lgdi32 -lcomdlg32 -lssl -lcrypto -lws2_32 -liphlpapi -lcrypt32
     KEEP =
     AMILINK = -static -Wl,--whole-archive $(AMILIB) -Wl,--no-whole-archive
     CAPTURE = $(AMIDIR)/windows/screen_capture.o
